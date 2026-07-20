@@ -2,11 +2,18 @@
 // (3000) cross-origin via CORS; in prod, both are same-origin on one port.
 const API_BASE = import.meta.env.DEV ? "http://127.0.0.1:3000" : "";
 
+// G01: append ?sessionId= to session-scoped routes (omitted → backend uses the
+// default/first live session, keeping single-session callers working).
+function sid(sessionId?: string): string {
+  return sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+}
+
 export async function sendPrompt(
   message: string,
   streamingBehavior?: "steer" | "followUp",
+  sessionId?: string,
 ): Promise<{ accepted: boolean; error?: string }> {
-  const res = await fetch(`${API_BASE}/api/prompt`, {
+  const res = await fetch(`${API_BASE}/api/prompt${sid(sessionId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message, streamingBehavior }),
@@ -14,8 +21,8 @@ export async function sendPrompt(
   return (await res.json()) as { accepted: boolean; error?: string };
 }
 
-export function eventStreamUrl(): string {
-  return `${API_BASE}/api/events`;
+export function eventStreamUrl(sessionId?: string): string {
+  return `${API_BASE}/api/events${sid(sessionId)}`;
 }
 
 export type ModelInfo = {
@@ -41,8 +48,9 @@ export async function getModels(): Promise<ModelInfo[]> {
 export async function switchModel(
   provider: string,
   id: string,
+  sessionId?: string,
 ): Promise<{ ok: boolean; error?: string; model?: { id: string; provider: string } }> {
-  const res = await fetch(`${API_BASE}/api/model`, {
+  const res = await fetch(`${API_BASE}/api/model${sid(sessionId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ provider, id }),
@@ -52,8 +60,9 @@ export async function switchModel(
 
 export async function setThinkingLevel(
   level: string,
+  sessionId?: string,
 ): Promise<{ ok: boolean; error?: string; level?: string }> {
-  const res = await fetch(`${API_BASE}/api/thinking`, {
+  const res = await fetch(`${API_BASE}/api/thinking${sid(sessionId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ level }),
@@ -61,13 +70,13 @@ export async function setThinkingLevel(
   return (await res.json()) as { ok: boolean; error?: string; level?: string };
 }
 
-export async function abortRun(): Promise<{ aborted: boolean }> {
-  const res = await fetch(`${API_BASE}/api/abort`, { method: "POST" });
+export async function abortRun(sessionId?: string): Promise<{ aborted: boolean }> {
+  const res = await fetch(`${API_BASE}/api/abort${sid(sessionId)}`, { method: "POST" });
   return (await res.json()) as { aborted: boolean };
 }
 
-export async function compactNow(customInstructions?: string): Promise<{ ok: boolean; error?: string }> {
-  const res = await fetch(`${API_BASE}/api/compact`, {
+export async function compactNow(customInstructions?: string, sessionId?: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${API_BASE}/api/compact${sid(sessionId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ customInstructions }),
@@ -94,8 +103,8 @@ export type SessionStat = {
   contextUsage?: ContextUsage;
 };
 
-export async function getStats(): Promise<SessionStat> {
-  const res = await fetch(`${API_BASE}/api/stats`);
+export async function getStats(sessionId?: string): Promise<SessionStat> {
+  const res = await fetch(`${API_BASE}/api/stats${sid(sessionId)}`);
   return (await res.json()) as SessionStat;
 }
 
@@ -106,8 +115,8 @@ export type HistSeg =
 
 export type HistMessage = { id: string; role: "user" | "assistant"; segments: HistSeg[] };
 
-export async function getMessages(): Promise<HistMessage[]> {
-  const res = await fetch(`${API_BASE}/api/messages`);
+export async function getMessages(sessionId?: string): Promise<HistMessage[]> {
+  const res = await fetch(`${API_BASE}/api/messages${sid(sessionId)}`);
   return (await res.json()) as HistMessage[];
 }
 
@@ -196,4 +205,135 @@ export async function switchSession(
     thinking: string;
     error?: string;
   };
+}
+
+// G01 multi-session
+export type LiveSession = {
+  sessionId: string;
+  cwd: string;
+  title: string | null;
+  streaming: boolean;
+  hasModel: boolean;
+  model: { id: string; provider: string } | null;
+  created: number;
+};
+
+export async function getLiveSessions(): Promise<{ sessions: LiveSession[]; max: number }> {
+  const res = await fetch(`${API_BASE}/api/sessions/live`);
+  return (await res.json()) as { sessions: LiveSession[]; max: number };
+}
+
+export async function renameSession(
+  sessionId: string,
+  title: string,
+): Promise<{ ok: boolean; title?: string; error?: string }> {
+  const res = await fetch(`${API_BASE}/api/session/rename`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, title }),
+  });
+  return (await res.json()) as { ok: boolean; title?: string; error?: string };
+}
+
+// ---- Settings (D01/G03: self-contained model provider config) ----
+
+export type SettingsProvider = {
+  id: string;
+  name?: string;
+  baseUrl?: string;
+  api?: string; // wire format for custom providers (KnownApi)
+  models?: string[]; // model ids this provider offers
+  contextWindow?: number;
+  maxTokens?: number;
+  custom?: boolean;
+  enabled?: boolean;
+  apiKey?: string; // write-only: sent on PUT, never returned by GET
+  hasKey?: boolean; // read-only: returned by GET
+};
+
+export type SettingsData = {
+  providers: SettingsProvider[];
+  maxSessions: number;
+};
+
+export async function getSettings(): Promise<SettingsData> {
+  const res = await fetch(`${API_BASE}/api/settings`);
+  return (await res.json()) as SettingsData;
+}
+
+export async function putSettings(
+  data: SettingsData,
+): Promise<{ ok: boolean; applied?: string[]; failed?: { id: string; error: string }[] }> {
+  const res = await fetch(`${API_BASE}/api/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  return (await res.json()) as { ok: boolean; applied?: string[]; failed?: { id: string; error: string }[] };
+}
+
+export type TestModel = {
+  id: string;
+  name: string;
+  provider: string;
+  reasoning: boolean;
+  contextWindow: number;
+};
+
+export async function testProvider(input: {
+  providerId: string;
+  apiKey?: string;
+  baseUrl?: string;
+  api?: string;
+  models?: string[];
+  contextWindow?: number;
+  maxTokens?: number;
+  custom?: boolean;
+}): Promise<{
+  ok: boolean;
+  models?: TestModel[];
+  source?: "live" | "registered";
+  warning?: string;
+  error?: string;
+}> {
+  const res = await fetch(`${API_BASE}/api/settings/test`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  return (await res.json()) as {
+    ok: boolean;
+    models?: TestModel[];
+    source?: "live" | "registered";
+    warning?: string;
+    error?: string;
+  };
+}
+
+export async function reloadSettings(): Promise<{
+  ok: boolean;
+  applied?: string[];
+  failed?: { id: string; error: string }[];
+}> {
+  const res = await fetch(`${API_BASE}/api/settings/reload`, { method: "POST" });
+  return (await res.json()) as { ok: boolean; applied?: string[]; failed?: { id: string; error: string }[] };
+}
+
+// G05 reconnect replay: full snapshot restored before resuming SSE.
+export type Snapshot = {
+  sessionId: string;
+  cwd: string;
+  model: { id: string; provider: string } | null;
+  thinking: string;
+  streaming: boolean;
+  messages: HistMessage[];
+  inProgress: { segments: HistSeg[] } | null;
+  pendingToolCalls: string[];
+  queue: { steering: string[]; followUp: string[] };
+  partialResults: Record<string, string[]>;
+};
+
+export async function getSnapshot(sessionId?: string): Promise<Snapshot> {
+  const res = await fetch(`${API_BASE}/api/snapshot${sid(sessionId)}`);
+  return (await res.json()) as Snapshot;
 }

@@ -21,13 +21,15 @@
 //   GET  /api/events           SSE stream of AgentSessionEvent
 
 import { serve } from "@hono/node-server";
+import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { execFile } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { promisify } from "node:util";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   createAgentSessionFromServices,
   createAgentSessionRuntime,
@@ -38,11 +40,32 @@ import {
   type AgentSessionRuntime,
   type CreateAgentSessionRuntimeFactory,
 } from "@earendil-works/pi-coding-agent";
+import {
+  applySettings,
+  loadCredentials,
+  loadSettings,
+  saveCredentials,
+  saveSettings,
+  type ProviderEntry,
+  type Settings,
+} from "./config";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const cwd = process.env.WEB_PI_CWD ?? process.cwd();
 
 const modelRuntime = await ModelRuntime.create();
+
+// Load self-contained config (~/.web-pi/*) and inject providers + keys into the
+// shared ModelRuntime. (D01/G04: web-pi owns its config, no pi install dependency.)
+const settingsState: Settings = await loadSettings();
+const credsState: Record<string, string> = await loadCredentials();
+const applyResult = await applySettings(modelRuntime, settingsState, credsState);
+if (applyResult.failed.length) {
+  console.warn(`[web-pi] settings: ${applyResult.failed.length} provider(s) failed to apply:`, applyResult.failed);
+}
+if (applyResult.applied.length) {
+  console.log(`[web-pi] settings: applied providers ${applyResult.applied.join(", ")}`);
+}
 
 // Runtime factory: closes over process-global inputs (modelRuntime) and
 // recreates cwd-bound services for the effective cwd. Reused on cwd switches.
@@ -69,14 +92,49 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({
   };
 };
 
-const holder: { runtime: AgentSessionRuntime } = {
-  runtime: await createAgentSessionRuntime(createRuntime, {
-    cwd,
+// G01 multi-session: live AgentSessionRuntimes keyed by AgentSession.sessionId,
+// concurrent up to settingsState.maxSessions. Created on demand (new or resume).
+// One default session is created at startup so the app works on first load
+// (backward compat: routes without ?sessionId= fall back to the first live one).
+const sessions = new Map<string, AgentSessionRuntime>();
+const sessionMeta = new Map<string, { cwd: string; title?: string; created: number }>();
+const maxSessions = () => settingsState.maxSessions ?? 4;
+
+async function makeSession(opts: { cwd: string; sessionPath?: string }): Promise<AgentSessionRuntime> {
+  if (sessions.size >= maxSessions()) {
+    throw new Error(`max sessions reached (${maxSessions()})`);
+  }
+  const sm = opts.sessionPath ? SessionManager.open(opts.sessionPath, undefined, opts.cwd) : SessionManager.create(opts.cwd);
+  const runtime = await createAgentSessionRuntime(createRuntime, {
+    cwd: opts.cwd,
     agentDir: getAgentDir(),
-    sessionManager: SessionManager.create(cwd),
-  }),
-};
-const rt = (): AgentSessionRuntime => holder.runtime;
+    sessionManager: sm,
+  });
+  sessions.set(runtime.session.sessionId, runtime);
+  sessionMeta.set(runtime.session.sessionId, { cwd: opts.cwd, created: Date.now() });
+  return runtime;
+}
+
+// Resolve a session for a request: explicit ?sessionId= wins, else the first
+// live session (keeps the single-session frontend working unchanged).
+type Ctx = { req: { query: (k: string) => string | undefined } };
+function pick(c: Ctx): AgentSessionRuntime | undefined {
+  const id = c.req.query("sessionId");
+  if (id && sessions.has(id)) return sessions.get(id);
+  for (const [, rt] of sessions) return rt;
+  return undefined;
+}
+function rt(c?: Ctx): AgentSessionRuntime {
+  if (c) {
+    const s = pick(c);
+    if (s) return s;
+  }
+  for (const [, r] of sessions) return r;
+  throw new Error("no live session");
+}
+
+// default session at startup
+await makeSession({ cwd });
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
@@ -131,13 +189,42 @@ function assistantSegments(content: unknown): HistSeg[] {
 const app = new Hono();
 app.use("/api/*", cors({ origin: "*" }));
 
+// G05 reconnect replay: ring-buffer each in-flight tool's `partialResult`
+// (tool incremental stdout) — SSE-only, not in AgentState. On reconnect the
+// snapshot route replays the buffered tail so a mid-tool refresh doesn't lose
+// the live stdout. Capped per toolCallId; cleared on tool_execution_end.
+const partialResultBuffer = new Map<string, string[]>();
+const PARTIAL_CAP = 50;
+function stringifyPartial(p: unknown): string {
+  if (typeof p === "string") return p;
+  if (p == null) return "";
+  try {
+    const j = JSON.stringify(p);
+    return j.length > 400 ? j.slice(0, 400) + "…" : j;
+  } catch {
+    return String(p);
+  }
+}
+function bufferPartial(event: { type?: string; toolCallId?: unknown; partialResult?: unknown }): void {
+  if (event.type === "tool_execution_update" && typeof event.toolCallId === "string") {
+    const txt = stringifyPartial(event.partialResult);
+    if (!txt) return;
+    const arr = partialResultBuffer.get(event.toolCallId) ?? [];
+    arr.push(txt);
+    if (arr.length > PARTIAL_CAP) arr.shift();
+    partialResultBuffer.set(event.toolCallId, arr);
+  } else if (event.type === "tool_execution_end" && typeof event.toolCallId === "string") {
+    partialResultBuffer.delete(event.toolCallId);
+  }
+}
+
 app.get("/api/health", (c) => {
-  const s = rt().session;
+  const s = rt(c).session;
   const m = s.model;
   return c.json({
     ok: true,
     sessionId: s.sessionId,
-    cwd: rt().cwd,
+    cwd: rt(c).cwd,
     streaming: s.isStreaming,
     hasModel: Boolean(m),
     model: m ? { id: m.id, provider: m.provider } : null,
@@ -145,10 +232,10 @@ app.get("/api/health", (c) => {
   });
 });
 
-app.get("/api/stats", (c) => c.json(rt().session.getSessionStats()));
+app.get("/api/stats", (c) => c.json(rt(c).session.getSessionStats()));
 
 app.get("/api/messages", (c) => {
-  const msgs = rt().session.messages;
+  const msgs = rt(c).session.messages;
   const out = msgs
     .filter((m) => m.role === "user" || m.role === "assistant")
     .map((m, i) => ({
@@ -163,7 +250,7 @@ app.get("/api/messages", (c) => {
 });
 
 app.get("/api/commands", (c) => {
-  const loader = rt().services.resourceLoader;
+  const loader = rt(c).services.resourceLoader;
   const prompts = loader
     .getPrompts()
     .prompts.map((p) => ({ cmd: `/${p.name}`, desc: p.description ?? "", kind: "prompt" as const }));
@@ -191,7 +278,7 @@ app.post("/api/model", async (c) => {
   if (!provider || !id) return c.json({ ok: false, error: "provider + id required" }, 400);
   const m = modelRuntime.getModel(provider, id);
   if (!m) return c.json({ ok: false, error: "model not found" }, 404);
-  await rt().session.setModel(m);
+  await rt(c).session.setModel(m);
   return c.json({ ok: true, model: { id: m.id, provider: m.provider } });
 });
 
@@ -200,7 +287,7 @@ app.post("/api/thinking", async (c) => {
   if (!level || !THINKING_LEVELS.includes(level as ThinkingLevel)) {
     return c.json({ ok: false, error: "invalid level" }, 400);
   }
-  rt().session.setThinkingLevel(level as ThinkingLevel);
+  rt(c).session.setThinkingLevel(level as ThinkingLevel);
   return c.json({ ok: true, level });
 });
 
@@ -211,8 +298,12 @@ app.post("/api/prompt", async (c) => {
   }>();
   const message = body.message?.trim();
   if (!message) return c.json({ accepted: false, error: "message required" }, 400);
+  // G01: auto-title this session from the first user prompt (if unnamed).
+  const runtime = rt(c);
+  const meta = sessionMeta.get(runtime.session.sessionId);
+  if (meta && !meta.title) meta.title = message.slice(0, 60);
   const result = await new Promise<{ accepted: boolean; error?: string }>((resolve) => {
-    rt().session
+    runtime.session
       .prompt(message, {
         streamingBehavior: body.streamingBehavior,
         preflightResult: (ok) => resolve({ accepted: ok, error: ok ? undefined : "session is busy (still streaming)" }),
@@ -223,14 +314,14 @@ app.post("/api/prompt", async (c) => {
 });
 
 app.post("/api/abort", async (c) => {
-  await rt().session.abort();
+  await rt(c).session.abort();
   return c.json({ aborted: true });
 });
 
 app.post("/api/compact", async (c) => {
   const { customInstructions } = await c.req.json<{ customInstructions?: string }>();
   try {
-    await rt().session.compact(customInstructions);
+    await rt(c).session.compact(customInstructions);
     return c.json({ ok: true });
   } catch (e) {
     return c.json({ ok: false, error: String(e) }, 500);
@@ -257,8 +348,8 @@ app.get("/api/sessions", async (c) => {
 app.delete("/api/sessions", async (c) => {
   const path = c.req.query("path");
   if (!path) return c.json({ ok: false, error: "path required" }, 400);
-  if (path === rt().session.sessionFile) {
-    return c.json({ ok: false, error: "cannot delete the active session" }, 409);
+  if ([...sessions.values()].some((rt) => rt.session.sessionFile === path)) {
+    return c.json({ ok: false, error: "cannot delete an active session" }, 409);
   }
   try {
     await unlink(path);
@@ -335,23 +426,19 @@ app.get("/api/dirs", (c) => {
   return c.json({ path: root, parent: dirname(root), entries, error: readError ? "cannot read path" : undefined });
 });
 
+// G01: create a new (or resume) live session. Returns its sessionId; the
+// frontend then targets that id in subsequent ?sessionId= calls.
 app.post("/api/session", async (c) => {
   const { cwd: newCwd, sessionPath } = await c.req.json<{ cwd?: string; sessionPath?: string }>();
   if (!newCwd) return c.json({ ok: false, error: "cwd required" }, 400);
   try {
-    rt().session.dispose();
-    const sm = sessionPath ? SessionManager.open(sessionPath, undefined, newCwd) : SessionManager.create(newCwd);
-    holder.runtime = await createAgentSessionRuntime(createRuntime, {
-      cwd: newCwd,
-      agentDir: getAgentDir(),
-      sessionManager: sm,
-    });
-    const s = rt().session;
+    const runtime = await makeSession({ cwd: newCwd, sessionPath });
+    const s = runtime.session;
     const m = s.model;
     return c.json({
       ok: true,
       sessionId: s.sessionId,
-      cwd: rt().cwd,
+      cwd: runtime.cwd,
       hasModel: Boolean(m),
       model: m ? { id: m.id, provider: m.provider } : null,
       thinking: s.thinkingLevel,
@@ -359,6 +446,246 @@ app.post("/api/session", async (c) => {
   } catch (e) {
     return c.json({ ok: false, error: String(e) }, 500);
   }
+});
+
+// G01: list in-memory live sessions (sidebar source).
+app.get("/api/sessions/live", (c) => {
+  const out = [...sessions.values()].map((rt) => {
+    const s = rt.session;
+    const meta = sessionMeta.get(s.sessionId);
+    const firstUser = s.messages.find((m) => m.role === "user");
+    const title = meta?.title ?? (firstUser ? extractText(firstUser.content).slice(0, 60) : null);
+    return {
+      sessionId: s.sessionId,
+      cwd: rt.cwd,
+      title,
+      streaming: s.isStreaming,
+      hasModel: Boolean(s.model),
+      model: s.model ? { id: s.model.id, provider: s.model.provider } : null,
+      created: meta?.created ?? 0,
+    };
+  });
+  return c.json({ sessions: out, max: maxSessions() });
+});
+
+// G01: rename a live session (title auto from first user message otherwise).
+app.post("/api/session/rename", async (c) => {
+  const { sessionId, title } = await c.req.json<{ sessionId?: string; title?: string }>();
+  if (!sessionId || !title?.trim()) return c.json({ ok: false, error: "sessionId + title required" }, 400);
+  const meta = sessionMeta.get(sessionId);
+  if (!meta) return c.json({ ok: false, error: "session not found" }, 404);
+  meta.title = title.trim();
+  return c.json({ ok: true, title: meta.title });
+});
+
+app.get("/api/settings", (c) => {
+  // Never leak api keys; surface hasKey instead.
+  const providers = settingsState.providers.map((p) => ({
+    id: p.id,
+    name: p.name,
+    baseUrl: p.baseUrl,
+    api: p.api,
+    models: p.models ?? [],
+    contextWindow: p.contextWindow,
+    maxTokens: p.maxTokens,
+    custom: p.custom,
+    enabled: p.enabled !== false,
+    hasKey: Boolean(credsState[p.id]),
+  }));
+  return c.json({ providers, maxSessions: settingsState.maxSessions });
+});
+
+// Body: { providers: ProviderEntry[] (each may carry transient `apiKey`), maxSessions }
+// Strips apiKey into credentials.json (0600), saves the rest to config.json,
+// then re-injects into the shared ModelRuntime so new requests pick it up.
+app.put("/api/settings", async (c) => {
+  const body = await c.req.json<{
+    providers?: Array<ProviderEntry & { apiKey?: string }>;
+    maxSessions?: number;
+  }>();
+  const providers: ProviderEntry[] = (body.providers ?? []).map((p) => ({
+    id: String(p.id),
+    name: p.name ? String(p.name) : undefined,
+    baseUrl: p.baseUrl ? String(p.baseUrl) : undefined,
+    api: p.api ? String(p.api) : undefined,
+    models: Array.isArray(p.models) ? p.models.map(String).filter(Boolean) : [],
+    contextWindow: typeof p.contextWindow === "number" ? p.contextWindow : undefined,
+    maxTokens: typeof p.maxTokens === "number" ? p.maxTokens : undefined,
+    custom: Boolean(p.custom),
+    enabled: p.enabled !== false,
+  }));
+  const maxSessions =
+    typeof body.maxSessions === "number" && body.maxSessions >= 1 && body.maxSessions <= 16
+      ? Math.floor(body.maxSessions)
+      : settingsState.maxSessions;
+
+  // Split secrets from non-secret config.
+  const newCreds: Record<string, string> = {};
+  for (const p of body.providers ?? []) {
+    if (typeof p.apiKey === "string" && p.apiKey.trim()) {
+      newCreds[String(p.id)] = p.apiKey.trim();
+    } else if (credsState[String(p.id)]) {
+      // keep existing key if not re-provided
+      newCreds[String(p.id)] = credsState[String(p.id)];
+    }
+  }
+
+  settingsState.providers = providers;
+  settingsState.maxSessions = maxSessions;
+  Object.keys(credsState).forEach((k) => delete credsState[k]);
+  Object.assign(credsState, newCreds);
+
+  await saveSettings(settingsState);
+  await saveCredentials(credsState);
+  const res = await applySettings(modelRuntime, settingsState, credsState);
+  return c.json({ ok: true, applied: res.applied, failed: res.failed });
+});
+
+// Test a provider: set the key (runtime, non-persistent) and fetch available
+// models. For custom OpenAI-compatible providers, enumerate via GET
+// {baseUrl}/models (the standard OpenAI /models endpoint) so the UI shows real
+// model ids, not just the registered fallback. Falls back to the registered
+// model if the endpoint doesn't expose /models. Does NOT persist the key.
+app.post("/api/settings/test", async (c) => {
+  const body = await c.req.json<{
+    providerId?: string;
+    apiKey?: string;
+    baseUrl?: string;
+    api?: string;
+    models?: string[];
+    contextWindow?: number;
+    maxTokens?: number;
+    custom?: boolean;
+  }>();
+  const providerId = body.providerId?.trim();
+  if (!providerId) return c.json({ ok: false, error: "providerId required" }, 400);
+  try {
+    if (body.custom && body.baseUrl) {
+      const api = body.api || "openai-completions";
+      const modelIds = body.models && body.models.length ? body.models : [providerId];
+      const ctx = body.contextWindow ?? 128000;
+      const maxTok = body.maxTokens ?? 8192; // max OUTPUT (max_completion_tokens), decoupled from input window
+      modelRuntime.registerProvider(providerId, {
+        name: providerId,
+        baseUrl: body.baseUrl,
+        authHeader: true,
+        api,
+        models: modelIds.map((id) => ({
+          id,
+          name: id,
+          api,
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: ctx,
+          maxTokens: maxTok,
+        })),
+      });
+    }
+    if (body.apiKey) await modelRuntime.setRuntimeApiKey(providerId, body.apiKey);
+    // effective key for the /models enumeration: prefer the just-provided key,
+    // fall back to the persisted credential (so fetch works without re-entering
+    // the key when hasKey is already true).
+    const effKey = body.apiKey || credsState[providerId];
+
+    // For custom OpenAI-compatible providers, try to enumerate real models via
+    // GET {baseUrl}/models so the picker shows actual ids, not the fallback.
+    let liveModels: { id: string; name: string; provider: string; reasoning: boolean; contextWindow: number }[] | null = null;
+    let liveErr: string | undefined;
+    if (body.custom && body.baseUrl && (body.api === "openai-completions" || body.api === "openai-responses" || (!body.api))) {
+      try {
+        const url = body.baseUrl.replace(/\/+$/, "") + "/models";
+        const r = await fetch(url, {
+          headers: effKey ? { Authorization: `Bearer ${effKey}` } : {},
+          signal: AbortSignal.timeout(8000),
+        });
+        if (r.ok) {
+          const j = (await r.json()) as { data?: { id?: string }[]; models?: { id?: string }[] };
+          const ids = (j.data ?? j.models ?? [])
+            .map((m) => m.id)
+            .filter((id): id is string => Boolean(id));
+          if (ids.length) {
+            liveModels = ids.map((id) => ({
+              id,
+              name: id,
+              provider: providerId,
+              reasoning: false,
+              contextWindow: body.contextWindow ?? 128000,
+            }));
+          }
+        } else {
+          liveErr = `endpoint returned ${r.status}`;
+        }
+      } catch (e) {
+        liveErr = String(e);
+      }
+    }
+
+    if (liveModels && liveModels.length) {
+      return c.json({ ok: true, models: liveModels, source: "live" });
+    }
+    // Fallback: return whatever the SDK has registered for this provider.
+    const models = await modelRuntime.getAvailable(providerId);
+    return c.json({
+      ok: true,
+      models: models.map((m) => ({
+        id: m.id,
+        name: m.name,
+        provider: m.provider,
+        reasoning: m.reasoning,
+        contextWindow: m.contextWindow,
+      })),
+      source: "registered",
+      warning: liveErr ? `could not fetch /models (${liveErr}); showing registered model` : undefined,
+    });
+  } catch (e) {
+    return c.json({ ok: false, error: String(e) }, 500);
+  }
+});
+
+// Force re-inject saved config into the running ModelRuntime (G03-Q5 "reload
+// providers" — for v1 single-session, PUT already applies; this is the explicit
+// hammer for custom-provider re-registration or key refresh).
+app.post("/api/settings/reload", async (c) => {
+  const res = await applySettings(modelRuntime, settingsState, credsState);
+  return c.json({ ok: true, applied: res.applied, failed: res.failed });
+});
+
+// G05 reconnect replay: full snapshot — settled history + in-progress
+// streamingMessage (current content blocks) + pending tool calls (marked
+// running) + queue (steer/followUp) + buffered partialResults. The frontend
+// fetches this on reconnect, then resumes the SSE stream for new events.
+app.get("/api/snapshot", (c) => {
+  const s = rt(c).session;
+  const st = s.state;
+  const streamingMessage = st.streamingMessage;
+  const messages = s.messages
+    .filter((m) => m.role === "user" || m.role === "assistant")
+    .map((m, i) => ({
+      id: String(i),
+      role: m.role as "user" | "assistant",
+      segments:
+        m.role === "assistant"
+          ? assistantSegments(m.content)
+          : [{ kind: "text" as const, text: extractText(m.content) }],
+    }));
+  const inProgress = streamingMessage
+    ? { segments: assistantSegments((streamingMessage as { content?: unknown }).content) }
+    : null;
+  const partials: Record<string, string[]> = {};
+  for (const [k, v] of partialResultBuffer) partials[k] = v;
+  return c.json({
+    sessionId: s.sessionId,
+    cwd: rt().cwd,
+    model: s.model ? { id: s.model.id, provider: s.model.provider } : null,
+    thinking: s.thinkingLevel,
+    streaming: s.isStreaming,
+    messages,
+    inProgress,
+    pendingToolCalls: [...st.pendingToolCalls],
+    queue: { steering: [...s.getSteeringMessages()], followUp: [...s.getFollowUpMessages()] },
+    partialResults: partials,
+  });
 });
 
 app.get("/api/events", (c) => {
@@ -375,7 +702,7 @@ app.get("/api/events", (c) => {
           // controller already closed
         }
       };
-      const s = rt().session;
+      const s = rt(c).session;
       const m = s.model;
       send({
         type: "session_init",
@@ -385,7 +712,10 @@ app.get("/api/events", (c) => {
         thinking: s.thinkingLevel,
         streaming: s.isStreaming,
       });
-      unsub = s.subscribe((event) => send(event));
+      unsub = s.subscribe((event) => {
+        bufferPartial(event as { type?: string; toolCallId?: unknown; partialResult?: unknown });
+        send(event);
+      });
       keepalive = setInterval(() => {
         try {
           controller.enqueue(encoder.encode(": keepalive\n\n"));
@@ -410,6 +740,18 @@ app.get("/api/events", (c) => {
   });
 });
 
+// Production static serving (G04): if dist/ exists (after `vite build`),
+// Hono serves the built frontend on the same :3000 port as the API, with an
+// SPA fallback to index.html. In dev (tsx watch), dist may exist from a prior
+// build but the user opens :5173 for HMR, so serving it on :3000 is harmless.
+const DIST_DIR = join(fileURLToPath(new URL(".", import.meta.url)), "..", "dist");
+if (existsSync(DIST_DIR)) {
+  app.use("/*", serveStatic({ root: DIST_DIR }));
+  // SPA fallback: any non-API, non-asset path returns the app shell.
+  app.get("/*", (c) => c.html(readFileSync(join(DIST_DIR, "index.html"), "utf8")));
+}
+
 serve({ fetch: app.fetch, hostname: "127.0.0.1", port: PORT }, (info) => {
-  console.log(`web-pi on http://127.0.0.1:${info.port} (cwd: ${rt().cwd})`);
+  const mode = existsSync(DIST_DIR) ? "prod (single-port, serving dist/)" : "dev (API only; web on :5173)";
+  console.log(`web-pi on http://127.0.0.1:${info.port} — ${mode} (cwd: ${rt().cwd})`);
 });

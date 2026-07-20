@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useReducer, useRef, useState, type KeyboardEvent } from "react";
+import { Fragment, useCallback, useEffect, useReducer, useRef, useState, type KeyboardEvent } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -10,7 +10,10 @@ import {
   getMessages,
   getModels,
   getSessions,
+  getSnapshot,
   getStats,
+  getLiveSessions,
+  renameSession,
   sendPrompt,
   setThinkingLevel,
   switchModel,
@@ -26,6 +29,9 @@ import { useEventStream, type AgentEvent } from "./hooks/useEventStream";
 import { CwdPicker } from "./components/CwdPicker";
 import { GitBranchPicker } from "./components/GitBranchPicker";
 import { SkillPicker } from "./components/SkillPicker";
+import { SettingsDrawer } from "./components/SettingsDrawer";
+import { Sidebar } from "./components/Sidebar";
+import type { LiveSession } from "./lib/api";
 
 type Seg =
   | { kind: "thinking"; id: string; text: string; done: boolean }
@@ -37,6 +43,7 @@ type Seg =
       status: "running" | "success" | "error";
       args?: string;
       result?: string;
+      partial?: string;
     }
   | { kind: "text"; id: string; text: string };
 
@@ -151,6 +158,9 @@ export function App() {
   const [connected, setConnected] = useState(false);
   const [input, setInput] = useState("");
   const [session, setSession] = useState<{ id: string; cwd: string } | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [liveSessions, setLiveSessions] = useState<LiveSession[]>([]);
+  const [liveMax, setLiveMax] = useState(4);
   const [model, setModel] = useState<{ id: string; provider: string } | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [thinking, setThinking] = useState<string>("off");
@@ -162,7 +172,7 @@ export function App() {
   const [gitInfo, setGitInfo] = useState<GitInfo | null>(null);
   const [branchPicker, setBranchPicker] = useState(false);
   const [skillPicker, setSkillPicker] = useState(false);
-  const [nonce, setNonce] = useState(0);
+  const [showSettings, setShowSettings] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [slashCmds, setSlashCmds] = useState<SlashCommand[]>([]);
   const [slashIndex, setSlashIndex] = useState(0);
@@ -187,9 +197,18 @@ export function App() {
 
   const fetchStats = async () => {
     try {
-      setStats(await getStats());
+      setStats(await getStats(activeSessionId ?? undefined));
     } catch (e) {
       pushSystem(`stats: ${String(e)}`, "err");
+    }
+  };
+  const fetchLiveSessions = async () => {
+    try {
+      const r = await getLiveSessions();
+      setLiveSessions(r.sessions);
+      setLiveMax(r.max);
+    } catch {
+      // ignore — sidebar just won't refresh
     }
   };
   const fetchGit = async () => {
@@ -208,7 +227,7 @@ export function App() {
   };
   const fetchMessages = async () => {
     try {
-      const ms = await getMessages();
+      const ms = await getMessages(activeSessionId ?? undefined);
       listRef.current = ms.map((m) => mapHistory(m));
       bump();
     } catch (e) {
@@ -235,6 +254,49 @@ export function App() {
     };
   }
 
+  // G05 reconnect replay: on reconnect while a turn is in progress, fetch the
+  // snapshot (settled history + in-progress streamingMessage + pending tools
+  // marked running + queue + buffered partialResult) and rebuild the chat list,
+  // then let the resumed SSE stream continue appending.
+  async function applySnapshot() {
+    try {
+      const snap = await getSnapshot(activeSessionId ?? undefined);
+      setSession({ id: snap.sessionId, cwd: snap.cwd });
+      if (snap.model) setModel(snap.model);
+      if (snap.thinking) setThinking(snap.thinking);
+      setStreaming(snap.streaming);
+      setConnected(true);
+      listRef.current = snap.messages.map(mapHistory);
+      if (snap.inProgress && snap.streaming) {
+        const pending = new Set(snap.pendingToolCalls);
+        const segs: Seg[] = snap.inProgress.segments.map((s) => {
+          const id = nextId();
+          if (s.kind === "thinking") return { kind: "thinking", id, text: s.text, done: true };
+          if (s.kind === "tool") {
+            const buf = snap.partialResults[s.id];
+            return {
+              kind: "tool",
+              id,
+              tcid: s.id,
+              name: s.name,
+              status: pending.has(s.id) ? "running" : "success",
+              ...(buf?.length ? { partial: buf.join("\n") } : {}),
+            };
+          }
+          return { kind: "text", id, text: s.text };
+        });
+        listRef.current = [...listRef.current, { kind: "assistant", id: nextId(), segs, streaming: true }];
+      }
+      setQueue({ steer: snap.queue.steering, follow: snap.queue.followUp });
+      bump();
+      void fetchStats();
+      void fetchGit();
+      void fetchSessions(snap.cwd);
+    } catch (e) {
+      pushSystem(`snapshot: ${String(e)}`, "err");
+    }
+  }
+
   useEventStream(
     (e: AgentEvent) => {
       // eslint-disable-next-line no-console
@@ -249,14 +311,20 @@ export function App() {
             streaming?: boolean;
           };
           setSession({ id: s.sessionId ?? "", cwd: s.cwd ?? "" });
+          setActiveSessionId(s.sessionId ?? null);
           if (s.model) setModel(s.model);
           if (s.thinking) setThinking(s.thinking);
           setStreaming(Boolean(s.streaming));
           setConnected(true);
-          if (!streaming) void fetchMessages();
+          // G05: if a turn is in progress on (re)connect, restore the full
+          // snapshot (settled + in-progress + pending tools + queue); else
+          // just reload settled history.
+          if (Boolean(s.streaming)) void applySnapshot();
+          else void fetchMessages();
           void fetchStats();
           void fetchGit();
           void fetchSessions(s.cwd ?? "");
+          void fetchLiveSessions();
           break;
         }
         case "agent_start": {
@@ -343,20 +411,24 @@ export function App() {
       }
     },
     setConnected,
-    nonce,
+    activeSessionId ?? undefined,
   );
 
-  useEffect(() => {
+  const refreshModels = useCallback(() => {
     void getModels()
       .then(setModels)
       .catch((e) => pushSystem(`models: ${String(e)}`, "err"));
   }, []);
 
   useEffect(() => {
+    void refreshModels();
+  }, [refreshModels]);
+
+  useEffect(() => {
     void getCommands()
       .then(setSlashCmds)
       .catch(() => {});
-  }, [nonce]);
+  }, [activeSessionId]);
 
   useEffect(() => {
     const el = chatRef.current;
@@ -390,7 +462,7 @@ export function App() {
     listRef.current = [...listRef.current, { kind: "user", id: nextId(), text }];
     setInput("");
     try {
-      const r = await sendPrompt(text, streaming ? "steer" : undefined);
+      const r = await sendPrompt(text, streaming ? "steer" : undefined, activeSessionId ?? undefined);
       if (!r.accepted) pushSystem(`prompt rejected: ${r.error ?? ""}`, "err");
     } catch (e) {
       pushSystem(`network: ${String(e)}`, "err");
@@ -399,7 +471,7 @@ export function App() {
 
   const doAbort = async () => {
     try {
-      await abortRun();
+      await abortRun(activeSessionId ?? undefined);
       pushSystem("aborted", "err");
     } catch (e) {
       pushSystem(`abort: ${String(e)}`, "err");
@@ -408,7 +480,7 @@ export function App() {
   const doCompact = async () => {
     pushSystem("compacting…", "a");
     try {
-      const r = await compactNow();
+      const r = await compactNow(undefined, activeSessionId ?? undefined);
       if (!r.ok) pushSystem(`compact: ${r.error ?? ""}`, "err");
     } catch (e) {
       pushSystem(`compact: ${String(e)}`, "err");
@@ -442,14 +514,14 @@ export function App() {
   const slashOpen = slashFiltered.length > 0;
 
   const onModelChange = async (provider: string, id: string) => {
-    const r = await switchModel(provider, id);
+    const r = await switchModel(provider, id, activeSessionId ?? undefined);
     if (r.ok && r.model) {
       setModel(r.model);
       pushSystem(`model ▸ ${r.model.id}`, "ok");
     } else pushSystem(`model: ${r.error ?? "failed"}`, "err");
   };
   const onThinkingChange = async (level: string) => {
-    const r = await setThinkingLevel(level);
+    const r = await setThinkingLevel(level, activeSessionId ?? undefined);
     if (r.ok) {
       setThinking(level);
       pushSystem(`thinking ▸ ${level}`, "ok");
@@ -460,18 +532,37 @@ export function App() {
     listRef.current = [];
     setStats(null);
     setQueue({ steer: [], follow: [] });
-    pushSystem(`switching → ${newCwd}${sessionPath ? " (resume)" : ""}`, "a");
+    pushSystem(`${sessionPath ? "resume" : "new session"} → ${newCwd}`, "a");
     try {
       const r = await switchSession(newCwd, sessionPath);
       if (r.ok) {
+        // G01: switchSession now CREATES a new live session; making it active
+        // reconnects the SSE stream to it (useEventStream dep on activeSessionId).
         setSession({ id: r.sessionId, cwd: r.cwd });
+        setActiveSessionId(r.sessionId);
         if (r.model) setModel(r.model);
         setThinking(r.thinking);
-        setNonce((x) => x + 1);
+        void fetchLiveSessions();
       } else pushSystem(`switch failed: ${r.error ?? ""}`, "err");
     } catch (e) {
       pushSystem(`switch: ${String(e)}`, "err");
     }
+  };
+  // G01: select an existing live session from the sidebar — point the SSE + all
+  // api calls at it; reload its messages/stats.
+  const selectSession = (id: string) => {
+    if (id === activeSessionId) return;
+    listRef.current = [];
+    setStats(null);
+    setQueue({ steer: [], follow: [] });
+    setActiveSessionId(id);
+  };
+  const newSession = async () => {
+    await doSwitch(session?.cwd ?? ".");
+  };
+  const doRename = async (id: string, title: string) => {
+    const r = await renameSession(id, title);
+    if (r.ok) void fetchLiveSessions();
   };
 
   const onDeleteSession = (path: string) => {
@@ -531,11 +622,29 @@ export function App() {
     <div className="flex h-full flex-col">
       <header className="app">
         <div className="brand">web-pi</div>
-        <span className={`pill ${liveState}`}>·{liveState === "on" ? "live" : liveState}</span>
+        <div className="head-right">
+          <span className={`pill ${liveState}`}>·{liveState === "on" ? "live" : liveState}</span>
+          <button
+            className={`gear ${showSettings ? "on" : ""}`}
+            onClick={() => setShowSettings((v) => !v)}
+            title="settings — model providers"
+            aria-label="settings"
+          >
+            ⚙
+          </button>
+        </div>
       </header>
 
       <div className="wrap">
         <div className="layout">
+          <Sidebar
+            sessions={liveSessions}
+            activeId={activeSessionId}
+            max={liveMax}
+            onSelect={(id) => selectSession(id)}
+            onNew={() => void newSession()}
+            onRename={(id, title) => void doRename(id, title)}
+          />
           <section className="chat">
             <div
               ref={chatRef}
@@ -634,9 +743,10 @@ export function App() {
                                 {s.status === "running" ? "…" : s.status === "success" ? "✓" : "✗"}
                               </span>
                             </div>
-                            {isExpanded(s) && (s.args || s.result) && (
+                            {isExpanded(s) && (s.args || s.partial || s.result) && (
                               <div className="body">
                                 {s.args && `args:\n${s.args}\n`}
+                                {s.partial && `live:\n${s.partial}\n`}
                                 {s.result && `result:\n${s.result}`}
                               </div>
                             )}
@@ -783,30 +893,6 @@ export function App() {
                 </>
               )}
             </div>
-
-            <div className="panel">
-              <h2>Sessions</h2>
-              {sessionsList.length === 0 ? (
-                <div className="empty">none in this cwd</div>
-              ) : (
-                sessionsList.slice(0, 12).map((s) => (
-                  <div key={s.path} className="session-row" onClick={() => void doSwitch(s.cwd || session?.cwd || "", s.path)}>
-                    <span className="ttl">{s.name || s.firstMessage?.slice(0, 40) || s.id.slice(0, 8)}</span>
-                    <span className="badge">{s.messageCount} msg</span>
-                    <button
-                      className="session-del"
-                      title="delete session"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void onDeleteSession(s.path);
-                      }}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                ))
-              )}
-            </div>
           </aside>
         </div>
       </div>
@@ -843,6 +929,12 @@ export function App() {
             setInput(rest ? `${cmd} ${rest}` : `${cmd} `);
             inputRef.current?.focus();
           }}
+        />
+      )}
+      {showSettings && (
+        <SettingsDrawer
+          onClose={() => setShowSettings(false)}
+          onProvidersChanged={refreshModels}
         />
       )}
     </div>

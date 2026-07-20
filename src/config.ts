@@ -1,0 +1,158 @@
+// web-pi self-contained config — owns its own provider config + credentials,
+// does NOT depend on pi's ~/.pi/agent. (D01/G04 decisions.)
+//
+//   ~/.web-pi/config.json      providers list + maxSessions (non-secret)
+//   ~/.web-pi/credentials.json providerId → apiKey (0600, plaintext, pi convention)
+//
+// On startup, applySettings() injects each provider into the SDK ModelRuntime:
+// built-in preset → setRuntimeApiKey only; custom (non-builtin baseUrl) →
+// registerProvider + setRuntimeApiKey.
+
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+
+const CONFIG_DIR = process.env.WEB_PI_HOME ?? join(homedir(), ".web-pi");
+const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+const CREDS_PATH = join(CONFIG_DIR, "credentials.json");
+
+/** A provider the user has configured. `custom` entries need registerProvider. */
+export type ProviderEntry = {
+  id: string; // SDK providerId
+  name?: string; // display name
+  baseUrl?: string; // only for custom (non-builtin) providers
+  api?: string; // wire format for custom providers (KnownApi, e.g. "openai-completions") — wires builtin streaming
+  models?: string[]; // model ids this provider offers (custom: registered as the provider's catalog)
+  contextWindow?: number; // custom provider model context window
+  maxTokens?: number; // custom provider model max output tokens
+  custom?: boolean; // true → registerProvider(id, {baseUrl, api, models}) on apply
+  enabled?: boolean; // default true; false = skip
+};
+
+export type Settings = {
+  providers: ProviderEntry[];
+  maxSessions: number;
+};
+
+const DEFAULTS: Settings = { providers: [], maxSessions: 4 };
+
+export async function loadSettings(): Promise<Settings> {
+  try {
+    const raw = await readFile(CONFIG_PATH, "utf8");
+    const parsed = JSON.parse(raw) as Partial<Settings>;
+    const providers: ProviderEntry[] = (parsed.providers ?? []).map((p: ProviderEntry & { model?: string }) => {
+      // backward compat: old single `model: string` → `models: [model]`
+      const models = Array.isArray(p.models)
+        ? p.models
+        : typeof p.model === "string" && p.model
+          ? [p.model]
+          : [];
+      const { model: _drop, ...rest } = p;
+      return { ...rest, models };
+    });
+    return {
+      providers,
+      maxSessions: typeof parsed.maxSessions === "number" ? parsed.maxSessions : DEFAULTS.maxSessions,
+    };
+  } catch {
+    return { ...DEFAULTS };
+  }
+}
+
+export async function saveSettings(s: Settings): Promise<void> {
+  await mkdir(CONFIG_DIR, { recursive: true });
+  await writeFile(CONFIG_PATH, JSON.stringify(s, null, 2), { mode: 0o600 });
+}
+
+export async function loadCredentials(): Promise<Record<string, string>> {
+  try {
+    return JSON.parse(await readFile(CREDS_PATH, "utf8")) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+export async function saveCredentials(c: Record<string, string>): Promise<void> {
+  await mkdir(CONFIG_DIR, { recursive: true });
+  await writeFile(CREDS_PATH, JSON.stringify(c, null, 2), { mode: 0o600 });
+  await chmod(CREDS_PATH, 0o600); // ensure 0600 even if file pre-existed
+}
+
+/**
+ * Inject configured providers + keys into the SDK ModelRuntime instance.
+ * Idempotent: registerProvider overwrites, setRuntimeApiKey overwrites.
+ * Custom providers previously registered but no longer in `settings` are
+ * unregistered (so deleting a custom provider removes it from the picker).
+ * Errors per-provider are logged, not thrown, so one bad entry doesn't break startup.
+ *
+ * Custom (non-builtin) providers: registered with `api` (wire format, wires the
+ * SDK's builtin streaming impl — no streamSimple needed) + a models spec so the
+ * model appears in getAvailable. This mirrors how pi's models.json defines a
+ * custom OpenAI-compatible provider.
+ */
+const registeredCustom = new Set<string>();
+
+export async function applySettings(
+  mr: ModelRuntime,
+  settings: Settings,
+  creds: Record<string, string>,
+): Promise<{ applied: string[]; failed: { id: string; error: string }[] }> {
+  const applied: string[] = [];
+  const failed: { id: string; error: string }[] = [];
+  const nextCustom = new Set<string>();
+  for (const p of settings.providers) {
+    if (p.enabled === false) continue;
+    if (p.custom && p.baseUrl) nextCustom.add(p.id);
+  }
+  // Unregister custom providers that were registered before but are gone now.
+  for (const id of registeredCustom) {
+    if (!nextCustom.has(id)) {
+      try {
+        mr.unregisterProvider(id);
+      } catch {
+        // already gone / nevermind
+      }
+      registeredCustom.delete(id);
+    }
+  }
+  for (const p of settings.providers) {
+    if (p.enabled === false) continue;
+    try {
+      if (p.custom && p.baseUrl) {
+        const api = p.api || "openai-completions";
+        const modelIds = p.models && p.models.length ? p.models : [p.id];
+        const ctx = p.contextWindow ?? 128000;
+        // maxTokens = MAX OUTPUT tokens (max_completion_tokens), NOT the input
+        // context window — decoupled so a 1M input window doesn't blow past an
+        // endpoint's output cap (e.g. GLM caps max_completion_tokens at 131072).
+        const maxTok = p.maxTokens ?? 8192;
+        mr.registerProvider(p.id, {
+          name: p.name ?? p.id,
+          baseUrl: p.baseUrl,
+          authHeader: true,
+          api,
+          models: modelIds.map((id) => ({
+            id,
+            name: id,
+            api,
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: ctx,
+            maxTokens: maxTok,
+          })),
+        });
+        registeredCustom.add(p.id);
+      }
+      const key = creds[p.id];
+      if (key) await mr.setRuntimeApiKey(p.id, key);
+      applied.push(p.id);
+    } catch (e) {
+      failed.push({ id: p.id, error: String(e) });
+    }
+  }
+  return { applied, failed };
+}
+
+export { CONFIG_DIR };

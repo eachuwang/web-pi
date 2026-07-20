@@ -6,13 +6,14 @@ import { eventStreamUrl } from "../lib/api";
 // per-event in the consumer.
 export type AgentEvent = { type: string; [key: string]: unknown };
 
-// `nonce` lets the caller force a reconnect (e.g. after a session switch): a
-// change tears down the old EventSource and opens a fresh one, whose first
-// frame is a session_init for the new session.
+// `sessionId` (G01) both picks the SSE target (eventStreamUrl(sessionId)) and
+// drives reconnection: switching the active session reopens the EventSource for
+// the new session's stream. On first load (sessionId undefined) the backend
+// defaults to the first live session.
 export function useEventStream(
   onEvent: (e: AgentEvent) => void,
   onState?: (connected: boolean) => void,
-  nonce?: number,
+  sessionId?: string,
 ): void {
   // Keep the latest handlers without re-subscribing on every render.
   const cb = useRef(onEvent);
@@ -20,7 +21,7 @@ export function useEventStream(
   const sb = useRef(onState);
   sb.current = onState;
   useEffect(() => {
-    const es = new EventSource(eventStreamUrl());
+    const es = new EventSource(eventStreamUrl(sessionId));
     es.onopen = () => sb.current?.(true);
     // EventSource auto-reconnects; onopen fires again on a successful reconnect.
     es.onerror = () => sb.current?.(false);
@@ -32,5 +33,5 @@ export function useEventStream(
       }
     };
     return () => es.close();
-  }, [nonce]);
+  }, [sessionId]);
 }

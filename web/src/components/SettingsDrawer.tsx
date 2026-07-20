@@ -1,0 +1,422 @@
+import { useEffect, useState } from "react";
+import {
+  getSettings,
+  putSettings,
+  reloadSettings,
+  testProvider,
+  type SettingsProvider,
+  type TestModel,
+} from "../lib/api";
+import { PRESET_PROVIDERS, PRESET_BY_ID } from "../lib/presets";
+
+// Right-side NON-MODAL drawer (G03-Q6): coexists with chat — no blocking
+// backdrop, chat stays interactive. Configures model providers (D01/G03):
+// presets (fixed baseUrl, key only) + custom (id/baseUrl/api/key/model), per-
+// provider model fetched via "test" (= test connection), max-sessions, reload.
+//
+// Custom providers register with `api` (wire format) — the SDK wires builtin
+// streaming from the api string (getApiProvider), so a custom OpenAI-compatible
+// endpoint with api="openai-completions" actually streams. This mirrors pi's
+// models.json. (R02/R03-era finding: api field is the key; streamSimple not needed.)
+
+const API_OPTIONS = [
+  { id: "openai-completions", name: "openai-completions (OpenAI chat / most mirrors)" },
+  { id: "openai-responses", name: "openai-responses" },
+  { id: "anthropic-messages", name: "anthropic-messages" },
+  { id: "google-generative-ai", name: "google-generative-ai" },
+  { id: "mistral-conversations", name: "mistral-conversations" },
+  { id: "pi-messages", name: "pi-messages" },
+];
+
+// Parse a context-window size with k / M shorthand: "1M" → 1_000_000,
+// "128k" → 128_000, "200000" → 200_000. Returns undefined if unparseable.
+function parseSize(s: string): number | undefined {
+  const m = s.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*([km]?)$/);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n)) return undefined;
+  const mult = m[2] === "k" ? 1000 : m[2] === "m" ? 1_000_000 : 1;
+  return Math.round(n * mult);
+}
+// Format a token count back to shorthand for display: 1_000_000 → "1M".
+function formatSize(n: number): string {
+  if (n >= 1_000_000 && n % 1_000_000 === 0) return `${n / 1_000_000}M`;
+  if (n >= 1000 && n % 1000 === 0) return `${n / 1000}k`;
+  return String(n);
+}
+
+type Row = SettingsProvider & { modelOptions?: TestModel[]; testing?: boolean; testErr?: string; ctxText?: string; maxTokText?: string };
+
+export function SettingsDrawer({
+  onClose,
+  onProvidersChanged,
+}: {
+  onClose: () => void;
+  onProvidersChanged?: () => void;
+}) {  const [rows, setRows] = useState<Row[]>([]);
+  const [maxSessions, setMaxSessions] = useState(4);
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState<{ kind: "ok" | "err" | "info"; msg: string } | null>(null);
+
+  useEffect(() => {
+    void (async () => {
+      const s = await getSettings();
+      setRows(
+        s.providers.map((p) => ({
+          ...p,
+          apiKey: "",
+          ctxText: formatSize(p.contextWindow ?? 128000),
+          maxTokText: formatSize(p.maxTokens ?? 8192),
+        })),
+      );
+      setMaxSessions(s.maxSessions ?? 4);
+    })().catch((e) => setStatus({ kind: "err", msg: `load failed: ${String(e)}` }));
+  }, []);
+
+  function patch(id: string, patch: Partial<Row>) {
+    setRows((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+    setDirty(true);
+  }
+
+  function addPreset(presetId: string) {
+    if (rows.some((r) => r.id === presetId)) return;
+    const p = PRESET_BY_ID.get(presetId);
+    setRows((rs) => [
+      ...rs,
+      {
+        id: presetId,
+        name: p?.name,
+        models: p?.exampleModelId ? [p.exampleModelId] : [],
+        custom: false,
+        enabled: true,
+        apiKey: "",
+      },
+    ]);
+    setDirty(true);
+  }
+
+  function addCustom() {
+    // give it a temp unique id until the user fills it
+    const id = `custom-${rows.length + 1}`;
+    setRows((rs) => [
+      ...rs,
+      { id, custom: true, enabled: true, apiKey: "", baseUrl: "", models: [], api: "openai-completions", contextWindow: 128000, ctxText: "128k", maxTokens: 8192, maxTokText: "8k" },
+    ]);
+    setDirty(true);
+  }
+
+  function removeRow(id: string) {
+    setRows((rs) => rs.filter((r) => r.id !== id));
+    setDirty(true);
+  }
+
+  async function fetchModels(r: Row) {
+    patch(r.id, { testing: true, testErr: undefined });
+    const res = await testProvider({
+      providerId: r.id,
+      apiKey: r.apiKey || undefined,
+      baseUrl: r.custom ? r.baseUrl : undefined,
+      api: r.custom ? r.api : undefined,
+      models: r.custom ? r.models : undefined,
+      contextWindow: r.custom ? r.contextWindow : undefined,
+      maxTokens: r.custom ? r.maxTokens : undefined,
+      custom: r.custom,
+    });
+    if (res.ok && res.models) {
+      patch(r.id, { modelOptions: res.models, testing: false });
+      if (res.source === "live") {
+        setStatus({ kind: "ok", msg: `${r.id}: ${res.models.length} models fetched — key OK` });
+      } else if (res.warning) {
+        setStatus({ kind: "err", msg: `${r.id}: ${res.warning}` });
+      } else {
+        setStatus({ kind: "info", msg: `${r.id}: ${res.models.length} model(s) (registered; key not validated against endpoint)` });
+      }
+      // /test registered the provider + set the key on the shared ModelRuntime,
+      // so the new model is now available to the top-bar picker — refresh it.
+      onProvidersChanged?.();
+    } else {
+      patch(r.id, { testing: false, testErr: res.error ?? "fetch failed" });
+      setStatus({ kind: "err", msg: `${r.id}: ${res.error ?? "fetch failed"}` });
+    }
+  }
+
+  async function save() {
+    setSaving(true);
+    // validate custom rows have id+baseUrl
+    for (const r of rows) {
+      if (r.custom && (!r.id || !r.baseUrl)) {
+        setStatus({ kind: "err", msg: `custom provider needs id + baseUrl` });
+        setSaving(false);
+        return;
+      }
+    }
+    const res = await putSettings({ providers: rows, maxSessions });
+    setSaving(false);
+    if (res.ok) {
+      setDirty(false);
+      const fail = res.failed?.length ?? 0;
+      setStatus({
+        kind: fail ? "err" : "ok",
+        msg: fail ? `saved; ${fail} provider(s) failed to apply` : `saved — ${res.applied?.length ?? 0} provider(s) applied`,
+      });
+      onProvidersChanged?.();
+    } else {
+      setStatus({ kind: "err", msg: "save failed" });
+    }
+  }
+
+  async function reload() {
+    const res = await reloadSettings();
+    setStatus({
+      kind: res.failed?.length ? "err" : "ok",
+      msg: `reloaded — ${res.applied?.length ?? 0} applied${res.failed?.length ? `, ${res.failed.length} failed` : ""}`,
+    });
+    onProvidersChanged?.();
+  }
+
+  return (
+    <aside className="settings-drawer" role="dialog" aria-label="Settings">
+      <header className="sd-head">
+        <h2>Settings</h2>
+        <button className="sd-close" onClick={onClose} title="close">✕</button>
+      </header>
+      <div className="sd-body">
+      <section className="sd-section">
+        <div className="sd-section-title">
+          <span>Model Providers</span>
+          <button className="sd-add" onClick={addCustom} title="add custom provider">+ custom</button>
+        </div>
+
+        <div className="sd-add-preset">
+          <select
+            defaultValue=""
+            onChange={(e) => {
+              if (e.target.value) addPreset(e.target.value);
+              e.target.value = "";
+            }}
+          >
+            <option value="">+ add preset provider…</option>
+            {PRESET_PROVIDERS.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {rows.length === 0 && <div className="sd-empty">no providers configured — add a preset above.</div>}
+
+        <div className="sd-providers">
+          {rows.map((r) => (
+            <ProviderRow
+              key={r.id}
+              row={r}
+              onChange={(p) => patch(r.id, p)}
+              onRemove={() => removeRow(r.id)}
+              onFetch={() => void fetchModels(r)}
+            />
+          ))}
+        </div>
+      </section>
+
+      <section className="sd-section">
+        <div className="sd-section-title">Max concurrent sessions</div>
+        <input
+          className="sd-input sd-num"
+          type="number"
+          min={1}
+          max={16}
+          value={maxSessions}
+          onChange={(e) => {
+            setMaxSessions(Number(e.target.value) || 4);
+            setDirty(true);
+          }}
+        />
+        <div className="sd-hint">applies to the multi-session build (G01); v1 single-session ignores this.</div>
+      </section>
+
+      {status && <div className={`sd-status sd-${status.kind}`}>{status.msg}</div>}
+      </div>
+
+      <footer className="sd-foot">
+        <button className="sd-btn-ghost" onClick={() => void reload()}>Reload providers</button>
+        <button className="sd-btn-primary" onClick={() => void save()} disabled={!dirty || saving}>
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </footer>
+    </aside>
+  );
+}
+
+function ProviderRow({
+  row,
+  onChange,
+  onRemove,
+  onFetch,
+}: {
+  row: Row;
+  onChange: (p: Partial<Row>) => void;
+  onRemove: () => void;
+  onFetch: () => void;
+}) {
+  const preset = !row.custom ? PRESET_BY_ID.get(row.id) : undefined;
+  const keyLabel = preset?.envVar ?? "API KEY";
+  return (
+    <div className={`sd-row${row.custom ? " sd-row-custom" : ""}`}>
+      <div className="sd-row-head">
+        <span className="sd-row-name">{preset?.name ?? row.name ?? row.id}</span>
+        {row.custom && <span className="sd-tag">custom</span>}
+        {!row.custom && <span className="sd-tag sd-tag-preset">preset</span>}
+        {row.hasKey && !row.apiKey && <span className="sd-tag sd-tag-key" title="key saved">key ✓</span>}
+        <button className="sd-row-del" onClick={onRemove} title="remove">✕</button>
+      </div>
+
+      {row.custom && (
+        <label className="sd-field">
+          <span>provider id</span>
+          <input
+            className="sd-input"
+            value={row.id}
+            placeholder="my-provider"
+            onChange={(e) => onChange({ id: e.target.value })}
+          />
+        </label>
+      )}
+      {row.custom && (
+        <label className="sd-field">
+          <span>base url</span>
+          <input
+            className="sd-input"
+            value={row.baseUrl ?? ""}
+            placeholder="https://…"
+            onChange={(e) => onChange({ baseUrl: e.target.value })}
+          />
+        </label>
+      )}
+      {row.custom && (
+        <label className="sd-field">
+          <span>api (wire format)</span>
+          <select
+            className="sd-input"
+            value={row.api ?? "openai-completions"}
+            onChange={(e) => onChange({ api: e.target.value })}
+          >
+            {API_OPTIONS.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      {row.custom && (
+        <label className="sd-field">
+          <span>context window (tokens, input)</span>
+          <input
+            className="sd-input sd-num"
+            type="text"
+            value={row.ctxText ?? ""}
+            placeholder="e.g. 128k or 1M"
+            onChange={(e) => {
+              const raw = e.target.value;
+              const parsed = parseSize(raw);
+              onChange({
+                ctxText: raw,
+                contextWindow: parsed ?? row.contextWindow ?? 128000,
+              });
+            }}
+            onBlur={(e) => {
+              // normalize display on blur if it parses
+              const parsed = parseSize(e.target.value);
+              if (parsed !== undefined) onChange({ ctxText: formatSize(parsed), contextWindow: parsed });
+            }}
+          />
+        </label>
+      )}
+      {row.custom && (
+        <label className="sd-field">
+          <span>max output tokens (max_completion_tokens)</span>
+          <input
+            className="sd-input sd-num"
+            type="text"
+            value={row.maxTokText ?? ""}
+            placeholder="e.g. 8k"
+            onChange={(e) => {
+              const raw = e.target.value;
+              const parsed = parseSize(raw);
+              onChange({
+                maxTokText: raw,
+                maxTokens: parsed ?? row.maxTokens ?? 8192,
+              });
+            }}
+            onBlur={(e) => {
+              const parsed = parseSize(e.target.value);
+              if (parsed !== undefined) onChange({ maxTokText: formatSize(parsed), maxTokens: parsed });
+            }}
+          />
+        </label>
+      )}
+
+      <label className="sd-field">
+        <span>{keyLabel.toLowerCase()}</span>
+        <input
+          className="sd-input"
+          type="password"
+          value={row.apiKey ?? ""}
+          placeholder={row.hasKey ? "•••• (enter to replace)" : "paste api key"}
+          onChange={(e) => onChange({ apiKey: e.target.value })}
+        />
+      </label>
+
+      <div className="sd-models">
+        <div className="sd-models-head">
+          <span>models</span>
+          <button
+            className="sd-add-model"
+            type="button"
+            onClick={() => onChange({ models: [...(row.models ?? []), ""] })}
+            title="add another model id"
+          >
+            + model
+          </button>
+        </div>
+        {(row.models ?? []).length === 0 && (
+          <div className="sd-hint">no model ids — click “+ model” to add one (or “fetch models” to enumerate).</div>
+        )}
+        {(row.models ?? []).map((mid, i) => (
+          <div className="sd-model-item" key={i}>
+            <input
+              className="sd-input"
+              list={`models-${row.id}`}
+              value={mid}
+              placeholder={preset?.exampleModelId || "model id"}
+              onChange={(e) => {
+                const next = [...(row.models ?? [])];
+                next[i] = e.target.value;
+                onChange({ models: next });
+              }}
+            />
+            <button
+              className="sd-model-del"
+              type="button"
+              title="remove model"
+              onClick={() => onChange({ models: (row.models ?? []).filter((_, j) => j !== i) })}
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+        <datalist id={`models-${row.id}`}>
+          {(row.modelOptions ?? []).map((m) => (
+            <option key={m.id} value={m.id}>{m.name}</option>
+          ))}
+        </datalist>
+        <button className="sd-fetch" onClick={onFetch} disabled={row.testing} title="fetch models + test key">
+          {row.testing ? "…" : "fetch models"}
+        </button>
+      </div>
+      {row.testErr && <div className="sd-err">{row.testErr}</div>}
+    </div>
+  );
+}
