@@ -1,9 +1,12 @@
-import { useEffect, useReducer, useRef, useState, type KeyboardEvent } from "react";
+import { Fragment, useEffect, useReducer, useRef, useState, type KeyboardEvent } from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   abortRun,
   compactNow,
   deleteSession,
   getCommands,
+  getGitBranch,
   getMessages,
   getModels,
   getSessions,
@@ -12,6 +15,7 @@ import {
   setThinkingLevel,
   switchModel,
   switchSession,
+  type GitInfo,
   type HistMessage,
   type ModelInfo,
   type SessionListItem,
@@ -20,6 +24,8 @@ import {
 } from "./lib/api";
 import { useEventStream, type AgentEvent } from "./hooks/useEventStream";
 import { CwdPicker } from "./components/CwdPicker";
+import { GitBranchPicker } from "./components/GitBranchPicker";
+import { SkillPicker } from "./components/SkillPicker";
 
 type Seg =
   | { kind: "thinking"; id: string; text: string; done: boolean }
@@ -68,12 +74,78 @@ const human = (n: number): string => {
 };
 const cap = (s: string, max = 4000): string => (s.length > max ? `${s.slice(0, max)}\n… (truncated)` : s);
 
+const skillFromTool = (name: string, args?: string): string | null => {
+  if (name !== "read" || !args) return null;
+  const bs = String.fromCharCode(92);
+  const norm = args.split(bs).join("/").replace(/[/]+/g, "/").toLowerCase();
+  const j = norm.indexOf("/skill.md");
+  if (j < 0) return null;
+  const before = norm.slice(0, j);
+  const k = before.lastIndexOf("skills/");
+  if (k < 0) return null;
+  return before.slice(k + 7) || null;
+};
+
+function ThinkingBody({ text, done }: { text: string; done: boolean }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (el && done) el.scrollTop = 0;
+  }, [done]);
+  return (
+    <div ref={ref} className={`body ${done ? "think-full" : "think-live"}`}>
+      <div className="think-text">{text}</div>
+    </div>
+  );
+}
+
+function TextSegment({ text, streaming }: { text: string; streaming: boolean }) {
+  const [mode, setMode] = useState<"preview" | "source">("preview");
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <div className="seg text">
+      <div className="seg-toolbar">
+        <button
+          className="seg-btn"
+          onClick={() => setMode((m) => (m === "preview" ? "source" : "preview"))}
+          title={mode === "preview" ? "show markdown source" : "show markdown preview"}
+        >
+          {mode === "preview" ? "md" : "preview"}
+        </button>
+        <button className="seg-btn" onClick={() => void copy()} title="copy output">
+          {copied ? "copied" : "copy"}
+        </button>
+      </div>
+      {mode === "preview" ? (
+        <div className="md">
+          <Markdown remarkPlugins={[remarkGfm]}>{text}</Markdown>
+          {streaming && <span className="cursor" />}
+        </div>
+      ) : (
+        <pre className="md-source">{text}{streaming && <span className="cursor" />}</pre>
+      )}
+    </div>
+  );
+}
+
 export function App() {
   const listRef = useRef<Entry[]>([]);
   const [, bump] = useReducer((x: number) => x + 1, 0);
   const idRef = useRef(0);
   const nextId = () => String(++idRef.current);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatRef = useRef<HTMLDivElement>(null);
+  const stickBottom = useRef(true);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const [streaming, setStreaming] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -87,6 +159,9 @@ export function App() {
   const [sessionsList, setSessionsList] = useState<SessionListItem[]>([]);
   const [picker, setPicker] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDlg | null>(null);
+  const [gitInfo, setGitInfo] = useState<GitInfo | null>(null);
+  const [branchPicker, setBranchPicker] = useState(false);
+  const [skillPicker, setSkillPicker] = useState(false);
   const [nonce, setNonce] = useState(0);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [slashCmds, setSlashCmds] = useState<SlashCommand[]>([]);
@@ -115,6 +190,13 @@ export function App() {
       setStats(await getStats());
     } catch (e) {
       pushSystem(`stats: ${String(e)}`, "err");
+    }
+  };
+  const fetchGit = async () => {
+    try {
+      setGitInfo(await getGitBranch());
+    } catch {
+      setGitInfo(null);
     }
   };
   const fetchSessions = async (cwdValue: string) => {
@@ -164,13 +246,16 @@ export function App() {
             cwd?: string;
             model?: { id: string; provider: string } | null;
             thinking?: string;
+            streaming?: boolean;
           };
           setSession({ id: s.sessionId ?? "", cwd: s.cwd ?? "" });
           if (s.model) setModel(s.model);
           if (s.thinking) setThinking(s.thinking);
+          setStreaming(Boolean(s.streaming));
           setConnected(true);
           if (!streaming) void fetchMessages();
           void fetchStats();
+          void fetchGit();
           void fetchSessions(s.cwd ?? "");
           break;
         }
@@ -274,8 +359,11 @@ export function App() {
   }, [nonce]);
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ block: "end" });
-  }, [listRef.current.length, streaming, expanded]);
+    const el = chatRef.current;
+    if (el && stickBottom.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  });
 
   const toggle = (id: string) =>
     setExpanded((prev) => {
@@ -298,6 +386,7 @@ export function App() {
         return;
       }
     }
+    stickBottom.current = true;
     listRef.current = [...listRef.current, { kind: "user", id: nextId(), text }];
     setInput("");
     try {
@@ -349,7 +438,7 @@ export function App() {
 
   const allCmds: Cmd[] = [...META_COMMANDS, ...slashCmds];
   const slashQ = input.trim().split(/\s+/)[0] ?? "";
-  const slashFiltered = input.startsWith("/") ? allCmds.filter((c) => c.cmd.startsWith(slashQ)) : [];
+  const slashFiltered = input.startsWith("/") && !input.includes(" ") ? allCmds.filter((c) => c.cmd.startsWith(slashQ)) : [];
   const slashOpen = slashFiltered.length > 0;
 
   const onModelChange = async (provider: string, id: string) => {
@@ -414,7 +503,7 @@ export function App() {
         setSlashIndex((i) => Math.max(i - 1, 0));
         return;
       }
-      if (ev.key === "Enter" || ev.key === "Tab") {
+      if ((ev.key === "Enter" && !ev.shiftKey) || ev.key === "Tab") {
         ev.preventDefault();
         if (slashFiltered[slashIndex]) selectCmd(slashFiltered[slashIndex]);
         return;
@@ -448,9 +537,39 @@ export function App() {
       <div className="wrap">
         <div className="layout">
           <section className="chat">
-            <div className="chatlog">
+            <div
+              ref={chatRef}
+              className="chatlog"
+              onScroll={() => {
+                const el = chatRef.current;
+                if (!el) return;
+                stickBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+              }}
+            >
               {entries.map((entry) => {
                 if (entry.kind === "user") {
+                  const sm = entry.text.match(/^\/skill:([^\s]+)\s*(.*)$/s);
+                  if (sm) {
+                    return (
+                      <Fragment key={entry.id}>
+                        {sm[2] && (
+                          <div className="msg user">
+                            <div className="role">you</div>
+                            <div className="body">{sm[2]}</div>
+                          </div>
+                        )}
+                        <div className="seg skill">
+                          <div className="head clickable" onClick={() => toggle(entry.id)}>
+                            <span className="chev">{expanded.has(entry.id) ? "▾" : "▸"}</span>
+                            <span className="tag">skill</span>
+                            <span className="name">{sm[1]}</span>
+                            <span className="status success">✓</span>
+                          </div>
+                          {expanded.has(entry.id) && <div className="body">{entry.text}</div>}
+                        </div>
+                      </Fragment>
+                    );
+                  }
                   return (
                     <div key={entry.id} className="msg user">
                       <div className="role">you</div>
@@ -484,11 +603,27 @@ export function App() {
                                 </span>
                               )}
                             </div>
-                            {(!s.done || isExpanded(s)) && s.text && <div className="body">{s.text}</div>}
+                            {(!s.done || isExpanded(s)) && s.text && <ThinkingBody text={s.text} done={s.done} />}
                           </div>
                         );
                       }
                       if (s.kind === "tool") {
+                        const skillName = skillFromTool(s.name, s.args);
+                        if (skillName) {
+                          return (
+                            <div key={s.id} className="seg skill">
+                              <div className="head clickable" onClick={() => toggle(s.id)}>
+                                <span className="chev">{isExpanded(s) ? "▾" : "▸"}</span>
+                                <span className="tag">skill</span>
+                                <span className="name">{skillName}</span>
+                                <span className={`status ${s.status}`}>
+                                  {s.status === "running" ? "…" : s.status === "success" ? "✓" : "✗"}
+                                </span>
+                              </div>
+                              {isExpanded(s) && s.args && <div className="body">{s.args}</div>}
+                            </div>
+                          );
+                        }
                         return (
                           <div key={s.id} className="seg tool">
                             <div className="head" onClick={() => toggle(s.id)}>
@@ -508,12 +643,7 @@ export function App() {
                           </div>
                         );
                       }
-                      return (
-                        <div key={s.id} className="seg text">
-                          {s.text}
-                          {entry.streaming && isLast && <span className="cursor" />}
-                        </div>
-                      );
+                      return <TextSegment key={s.id} text={s.text} streaming={entry.streaming && isLast} />;
                     })}
                   </div>
                 );
@@ -538,6 +668,7 @@ export function App() {
                 </div>
               )}
               <textarea
+                ref={inputRef}
                 value={input}
                 onChange={(e) => {
                   setInput(e.target.value);
@@ -587,9 +718,22 @@ export function App() {
                   </option>
                 ))}
               </select>
+              <span className="ctrl-label">skill</span>
+              <button
+                className="git-btn"
+                onClick={() => setSkillPicker(true)}
+                disabled={streaming || !slashCmds.some((c) => c.kind === "skill")}
+                title="pick a skill"
+              >
+                <span className="branch-name">skill</span> <span className="arr" />
+              </button>
               <span className="ctrl-label">current Dir</span>
               <button className="cwd-btn" onClick={() => setPicker(true)} title="switch cwd / resume session">
-                <span className="cwd">{session?.cwd ?? "…"}</span> <span className="arr">▾</span>
+                <span className="cwd">{session?.cwd ?? "…"}</span> <span className="arr" />
+              </button>
+              <span className="ctrl-label">git</span>
+              <button className="git-btn" onClick={() => setBranchPicker(true)} disabled={!gitInfo?.repo} title={gitInfo?.repo ? gitInfo.current : "not a git repo"}>
+                <span className="branch-name">{gitInfo ? (gitInfo.repo ? gitInfo.current : "no git") : "…"}</span> <span className="arr" />
               </button>
             </div>
           </section>
@@ -686,6 +830,20 @@ export function App() {
             </div>
           </div>
         </div>
+      )}
+      {branchPicker && (
+        <GitBranchPicker onClose={() => setBranchPicker(false)} onChanged={() => void fetchGit()} />
+      )}
+      {skillPicker && (
+        <SkillPicker
+          skills={slashCmds.filter((c) => c.kind === "skill")}
+          onClose={() => setSkillPicker(false)}
+          onPick={(cmd) => {
+            const rest = input.trim();
+            setInput(rest ? `${cmd} ${rest}` : `${cmd} `);
+            inputRef.current?.focus();
+          }}
+        />
       )}
     </div>
   );

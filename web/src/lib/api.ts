@@ -141,6 +141,35 @@ export async function deleteSession(path: string): Promise<{ ok: boolean; error?
   return (await res.json()) as { ok: boolean; error?: string };
 }
 
+export type GitInfo = { repo: boolean; current: string; branches: string[] };
+
+export async function getGitBranch(cwd?: string): Promise<GitInfo> {
+  const q = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
+  const res = await fetch(`${API_BASE}/api/git/branch${q}`);
+  return (await res.json()) as GitInfo;
+}
+
+export async function gitCheckout(branch: string): Promise<{ ok: boolean; current?: string; error?: string }> {
+  const res = await fetch(`${API_BASE}/api/git/checkout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ branch }),
+  });
+  return (await res.json()) as { ok: boolean; current?: string; error?: string };
+}
+
+export async function gitCreateBranch(
+  name: string,
+  from?: string,
+): Promise<{ ok: boolean; current?: string; error?: string }> {
+  const res = await fetch(`${API_BASE}/api/git/branch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, from }),
+  });
+  return (await res.json()) as { ok: boolean; current?: string; error?: string };
+}
+
 export async function switchSession(
   cwd: string,
   sessionPath?: string,

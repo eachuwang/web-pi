@@ -6,6 +6,14 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   root: "web",
   plugins: [react()],
-  server: { port: 5173, host: "127.0.0.1" },
+  server: {
+    port: 5173,
+    host: "127.0.0.1",
+    watch: {
+      usePolling: true,
+      interval: 100,
+      awaitWriteFinish: { stabilityThreshold: 250, pollInterval: 50 },
+    },
+  },
   build: { outDir: "../dist", emptyOutDir: true },
 });

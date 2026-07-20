@@ -23,8 +23,10 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { execFile } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { unlink } from "node:fs/promises";
+import { promisify } from "node:util";
 import { dirname, join } from "node:path";
 import {
   createAgentSessionFromServices,
@@ -213,7 +215,7 @@ app.post("/api/prompt", async (c) => {
     rt().session
       .prompt(message, {
         streamingBehavior: body.streamingBehavior,
-        preflightResult: (ok) => resolve({ accepted: ok }),
+        preflightResult: (ok) => resolve({ accepted: ok, error: ok ? undefined : "session is busy (still streaming)" }),
       })
       .catch((e: unknown) => resolve({ accepted: false, error: String(e) }));
   });
@@ -264,6 +266,58 @@ app.delete("/api/sessions", async (c) => {
   } catch (e) {
     return c.json({ ok: false, error: String(e) }, 500);
   }
+});
+
+const execFileP = promisify(execFile);
+const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/;
+async function runGit(
+  cwd: string,
+  args: string[],
+): Promise<{ ok: true; stdout: string } | { ok: false; error: string }> {
+  try {
+    const out = await execFileP("git", ["-C", cwd, ...args], { encoding: "utf8" });
+    return { ok: true, stdout: String(out.stdout) };
+  } catch (e) {
+    const ex = e as { stderr?: unknown; message?: string };
+    const raw = ex.stderr;
+    const stderr =
+      typeof raw === "string"
+        ? raw
+        : Buffer.isBuffer(raw)
+          ? raw.toString("utf8")
+          : "";
+    return { ok: false, error: (stderr || ex.message || String(e)).trim() };
+  }
+}
+
+app.get("/api/git/branch", async (c) => {
+  const cwd = c.req.query("cwd") ?? rt().cwd;
+  const cur = await runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  if (!cur.ok) return c.json({ repo: false, current: "", branches: [] });
+  const lst = await runGit(cwd, ["for-each-ref", "--format=%(refname:short)", "refs/heads/"]);
+  const branches = lst.ok ? lst.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+  return c.json({ repo: true, current: cur.stdout.trim(), branches });
+});
+
+app.post("/api/git/checkout", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as { branch?: string };
+  const branch = (body.branch ?? "").trim();
+  if (!BRANCH_RE.test(branch)) return c.json({ ok: false, error: "invalid branch name" }, 400);
+  const r = await runGit(rt().cwd, ["checkout", branch]);
+  if (!r.ok) return c.json({ ok: false, error: r.error }, 500);
+  return c.json({ ok: true, current: branch });
+});
+
+app.post("/api/git/branch", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as { name?: string; from?: string };
+  const name = (body.name ?? "").trim();
+  const from = (body.from ?? "").trim();
+  if (!BRANCH_RE.test(name)) return c.json({ ok: false, error: "invalid branch name" }, 400);
+  if (from && !BRANCH_RE.test(from)) return c.json({ ok: false, error: "invalid base branch" }, 400);
+  const args = from ? ["checkout", "-b", name, from] : ["checkout", "-b", name];
+  const r = await runGit(rt().cwd, args);
+  if (!r.ok) return c.json({ ok: false, error: r.error }, 500);
+  return c.json({ ok: true, current: name });
 });
 
 app.get("/api/dirs", (c) => {
@@ -329,6 +383,7 @@ app.get("/api/events", (c) => {
         cwd: rt().cwd,
         model: m ? { id: m.id, provider: m.provider } : null,
         thinking: s.thinkingLevel,
+        streaming: s.isStreaming,
       });
       unsub = s.subscribe((event) => send(event));
       keepalive = setInterval(() => {
