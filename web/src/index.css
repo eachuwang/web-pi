@@ -1127,6 +1127,28 @@ header.app {
   color: var(--green);
   border: 1px solid #bfe3c8;
 }
+.queue-item .tag.running {
+  color: var(--accent);
+  border: 1px solid #f0c4b4;
+  position: relative;
+  padding-left: 13px;
+}
+.queue-item .tag.running::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  width: 5px;
+  height: 5px;
+  margin-top: -3px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
 .queue-item .txt {
   overflow: hidden;
   text-overflow: ellipsis;

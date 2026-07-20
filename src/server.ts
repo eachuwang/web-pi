@@ -44,10 +44,13 @@ import {
   applySettings,
   loadCredentials,
   loadSettings,
+  loadUsage,
+  recordUsage,
   saveCredentials,
   saveSettings,
   type ProviderEntry,
   type Settings,
+  type UsageData,
 } from "./config";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -135,6 +138,27 @@ function rt(c?: Ctx): AgentSessionRuntime {
 
 // default session at startup
 await makeSession({ cwd });
+
+// G02 cost odometer flush: every 15s snapshot all live sessions into
+// ~/.web-pi/usage.json. Idempotent (snapshot-overwrite per sessionFile), so
+// multi-client agent_end + this interval can't double-count. Connection-
+// independent — catches turns driven without an SSE listener. On restart the
+// resumed session's getSessionStats() recomputes cumulatively from the file,
+// so the first post-crash flush recovers any unflushed turn.
+async function flushUsage(): Promise<void> {
+  for (const r of sessions.values()) {
+    try {
+      const st = r.session.getSessionStats();
+      await recordUsage(
+        { sessionFile: st.sessionFile, cost: st.cost, tokens: st.tokens, toolCalls: st.toolCalls, totalMessages: st.totalMessages },
+        r.cwd,
+      );
+    } catch {
+      // a session mid-teardown may throw — skip it this round
+    }
+  }
+}
+setInterval(() => void flushUsage(), 15_000);
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
@@ -232,7 +256,21 @@ app.get("/api/health", (c) => {
   });
 });
 
-app.get("/api/stats", (c) => c.json(rt(c).session.getSessionStats()));
+app.get("/api/stats", (c) => {
+  const s = rt(c).session;
+  // G02: surface in-flight tools alongside the per-session cost/tokens so the
+  // dashboard's Queue panel can mark pendingToolCalls as running without a
+  // separate snapshot fetch.
+  return c.json({ ...s.getSessionStats(), pendingToolCalls: [...s.state.pendingToolCalls] });
+});
+
+// G02: cross-session cost odometer — total spend across every session ever,
+// persisted at ~/.web-pi/usage.json. Per-session live cost still comes from
+// /api/stats (getSessionStats); this is the all-time aggregate for the dashboard.
+app.get("/api/usage", async (c) => {
+  const u: UsageData = await loadUsage();
+  return c.json(u);
+});
 
 app.get("/api/messages", (c) => {
   const msgs = rt(c).session.messages;
@@ -715,6 +753,12 @@ app.get("/api/events", (c) => {
       unsub = s.subscribe((event) => {
         bufferPartial(event as { type?: string; toolCallId?: unknown; partialResult?: unknown });
         send(event);
+        // G02: a turn just finalized its cost — flush this session's snapshot
+        // immediately so the dashboard's all-time total updates without the
+        // 15s interval lag. Idempotent (snapshot-overwrite).
+        if ((event as { type?: string }).type === "agent_end") {
+          void flushUsage();
+        }
       });
       keepalive = setInterval(() => {
         try {

@@ -12,6 +12,7 @@ import {
   getSessions,
   getSnapshot,
   getStats,
+  getUsage,
   getLiveSessions,
   renameSession,
   sendPrompt,
@@ -24,6 +25,7 @@ import {
   type SessionListItem,
   type SessionStat,
   type SlashCommand,
+  type UsageData,
 } from "./lib/api";
 import { useEventStream, type AgentEvent } from "./hooks/useEventStream";
 import { CwdPicker } from "./components/CwdPicker";
@@ -78,6 +80,13 @@ const human = (n: number): string => {
   if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
   if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
   return `${(n / 1_000_000).toFixed(1)}M`;
+};
+const money = (n: number): string => {
+  if (!isFinite(n) || n <= 0) return "$0.00";
+  if (n < 0.01) return "<$0.01";
+  if (n < 1) return `$${n.toFixed(2)}`;
+  if (n < 100) return `$${n.toFixed(2)}`;
+  return `$${n.toFixed(0)}`;
 };
 const cap = (s: string, max = 4000): string => (s.length > max ? `${s.slice(0, max)}\n… (truncated)` : s);
 
@@ -166,6 +175,7 @@ export function App() {
   const [thinking, setThinking] = useState<string>("off");
   const [queue, setQueue] = useState<{ steer: string[]; follow: string[] }>({ steer: [], follow: [] });
   const [stats, setStats] = useState<SessionStat | null>(null);
+  const [usage, setUsage] = useState<UsageData | null>(null);
   const [sessionsList, setSessionsList] = useState<SessionListItem[]>([]);
   const [picker, setPicker] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDlg | null>(null);
@@ -200,6 +210,13 @@ export function App() {
       setStats(await getStats(activeSessionId ?? undefined));
     } catch (e) {
       pushSystem(`stats: ${String(e)}`, "err");
+    }
+  };
+  const fetchUsage = async () => {
+    try {
+      setUsage(await getUsage());
+    } catch {
+      // odometer optional — dashboard just won't show the all-time total
     }
   };
   const fetchLiveSessions = async () => {
@@ -290,6 +307,7 @@ export function App() {
       setQueue({ steer: snap.queue.steering, follow: snap.queue.followUp });
       bump();
       void fetchStats();
+      void fetchUsage();
       void fetchGit();
       void fetchSessions(snap.cwd);
     } catch (e) {
@@ -322,6 +340,7 @@ export function App() {
           if (Boolean(s.streaming)) void applySnapshot();
           else void fetchMessages();
           void fetchStats();
+          void fetchUsage();
           void fetchGit();
           void fetchSessions(s.cwd ?? "");
           void fetchLiveSessions();
@@ -338,6 +357,7 @@ export function App() {
           if (a) a.streaming = false;
           setStreaming(false);
           void fetchStats();
+          void fetchUsage();
           bump();
           break;
         }
@@ -873,8 +893,64 @@ export function App() {
             </div>
 
             <div className="panel">
+              <h2>Cost</h2>
+              <div className="stats">
+                <div className="stat">
+                  <div className="k">this session</div>
+                  <div className="v">{money(stats?.cost ?? 0)}</div>
+                </div>
+                <div className="stat">
+                  <div className="k">all time</div>
+                  <div className="v">{money(usage?.total.cost ?? 0)}</div>
+                </div>
+              </div>
+              {usage?.total.toolCalls ? (
+                <div className="kv">
+                  <span className="k">total tool calls</span>
+                  <span className="v">{human(usage.total.toolCalls)}</span>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="panel">
+              <h2>Tokens</h2>
+              {stats ? (
+                <div className="stats">
+                  <div className="stat">
+                    <div className="k">input</div>
+                    <div className="v">{human(stats.tokens.input)}</div>
+                  </div>
+                  <div className="stat">
+                    <div className="k">output</div>
+                    <div className="v">{human(stats.tokens.output)}</div>
+                  </div>
+                  <div className="stat">
+                    <div className="k">cache read</div>
+                    <div className="v">{human(stats.tokens.cacheRead)}</div>
+                  </div>
+                  <div className="stat">
+                    <div className="k">total</div>
+                    <div className="v">{human(stats.tokens.total)}</div>
+                  </div>
+                </div>
+              ) : (
+                <div className="empty">—</div>
+              )}
+            </div>
+
+            <div className="panel">
               <h2>Queue</h2>
-              {queue.steer.length === 0 && queue.follow.length === 0 ? (
+              {stats && stats.pendingToolCalls.length > 0 && (
+                <>
+                  {stats.pendingToolCalls.map((tc) => (
+                    <div key={`p${tc}`} className="queue-item">
+                      <span className="tag running">running</span>
+                      <span className="txt">{tc}</span>
+                    </div>
+                  ))}
+                </>
+              )}
+              {queue.steer.length === 0 && queue.follow.length === 0 && (!stats || stats.pendingToolCalls.length === 0) ? (
                 <div className="empty">no queued messages</div>
               ) : (
                 <>

@@ -16,6 +16,7 @@ import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 const CONFIG_DIR = process.env.WEB_PI_HOME ?? join(homedir(), ".web-pi");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const CREDS_PATH = join(CONFIG_DIR, "credentials.json");
+const USAGE_PATH = join(CONFIG_DIR, "usage.json");
 
 /** A provider the user has configured. `custom` entries need registerProvider. */
 export type ProviderEntry = {
@@ -77,6 +78,87 @@ export async function saveCredentials(c: Record<string, string>): Promise<void> 
   await mkdir(CONFIG_DIR, { recursive: true });
   await writeFile(CREDS_PATH, JSON.stringify(c, null, 2), { mode: 0o600 });
   await chmod(CREDS_PATH, 0o600); // ensure 0600 even if file pre-existed
+}
+
+// G02 cost odometer — cross-session spend persisted to ~/.web-pi/usage.json.
+// getSessionStats() already recomputes per-session cost cumulatively from the
+// session file (survives resume/restart for one session); the odometer's job is
+// the cross-session aggregate (total spend across every session ever) which
+// per-session stats can't give. Keyed by sessionFile (stable identity across
+// resume; sessionId may rotate on resume). Each entry is a snapshot, overwritten
+// on each flush — never additive — so resume/restart can't double-count.
+export type UsageTokens = { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+export type UsageEntry = {
+  sessionFile: string;
+  cwd?: string;
+  cost: number;
+  tokens: UsageTokens;
+  toolCalls: number;
+  totalMessages: number;
+  updated: number; // epoch ms
+};
+export type UsageTotals = { cost: number; tokens: UsageTokens; toolCalls: number };
+export type UsageData = {
+  sessions: Record<string, UsageEntry>; // keyed by sessionFile
+  total: UsageTotals;
+  updated: number;
+};
+
+const EMPTY_TOKENS: UsageTokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+
+export async function loadUsage(): Promise<UsageData> {
+  try {
+    const raw = JSON.parse(await readFile(USAGE_PATH, "utf8")) as Partial<UsageData>;
+    return {
+      sessions: typeof raw.sessions === "object" && raw.sessions ? raw.sessions : {},
+      total: raw.total ?? { cost: 0, tokens: { ...EMPTY_TOKENS }, toolCalls: 0 },
+      updated: raw.updated ?? 0,
+    };
+  } catch {
+    return { sessions: {}, total: { cost: 0, tokens: { ...EMPTY_TOKENS }, toolCalls: 0 }, updated: 0 };
+  }
+}
+
+function recomputeTotal(sessions: Record<string, UsageEntry>): UsageTotals {
+  const tot: UsageTotals = { cost: 0, tokens: { ...EMPTY_TOKENS }, toolCalls: 0 };
+  for (const e of Object.values(sessions)) {
+    tot.cost += e.cost;
+    tot.toolCalls += e.toolCalls;
+    for (const k of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) {
+      tot.tokens[k] += e.tokens[k];
+    }
+  }
+  return tot;
+}
+
+// Upsert one session's snapshot, recompute cross-session totals, persist.
+// Accepts a minimal struct (not the SDK SessionStats type) so config.ts stays
+// decoupled from SDK internals. No-op if sessionFile is undefined (can't key).
+let usageWriteLock: Promise<void> = Promise.resolve();
+export async function recordUsage(
+  s: { sessionFile?: string; cost: number; tokens: UsageTokens; toolCalls: number; totalMessages: number },
+  cwd?: string,
+): Promise<void> {
+  if (!s.sessionFile) return;
+  // Serialize writes so concurrent flushes (multi-session interval + agent_end)
+  // don't clobber each other's read-modify-write.
+  usageWriteLock = usageWriteLock.then(async () => {
+    const data = await loadUsage();
+    data.sessions[s.sessionFile!] = {
+      sessionFile: s.sessionFile!,
+      cwd,
+      cost: s.cost,
+      tokens: s.tokens,
+      toolCalls: s.toolCalls,
+      totalMessages: s.totalMessages,
+      updated: Date.now(),
+    };
+    data.total = recomputeTotal(data.sessions);
+    data.updated = Date.now();
+    await mkdir(CONFIG_DIR, { recursive: true });
+    await writeFile(USAGE_PATH, JSON.stringify(data, null, 2));
+  });
+  await usageWriteLock;
 }
 
 /**

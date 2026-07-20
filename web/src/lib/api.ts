@@ -101,11 +101,34 @@ export type SessionStat = {
   tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
   cost: number;
   contextUsage?: ContextUsage;
+  pendingToolCalls: string[]; // G02: in-flight tool ids (marked running in Queue panel)
 };
 
 export async function getStats(sessionId?: string): Promise<SessionStat> {
   const res = await fetch(`${API_BASE}/api/stats${sid(sessionId)}`);
   return (await res.json()) as SessionStat;
+}
+
+// G02 cost odometer — cross-session all-time spend (~/.web-pi/usage.json).
+export type UsageTokens = { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+export type UsageEntry = {
+  sessionFile: string;
+  cwd?: string;
+  cost: number;
+  tokens: UsageTokens;
+  toolCalls: number;
+  totalMessages: number;
+  updated: number;
+};
+export type UsageData = {
+  sessions: Record<string, UsageEntry>;
+  total: { cost: number; tokens: UsageTokens; toolCalls: number };
+  updated: number;
+};
+
+export async function getUsage(): Promise<UsageData> {
+  const res = await fetch(`${API_BASE}/api/usage`);
+  return (await res.json()) as UsageData;
 }
 
 export type HistSeg =
