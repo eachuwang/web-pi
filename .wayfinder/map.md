@@ -47,8 +47,8 @@ created: 2026-07-20
 
 <!-- 见「Fog of war」:在 scope 内但还无法精确成票的暗区。随 frontier 推进毕业成票。 -->
 
-<!-- 当前无未票化 fog。剩 G05(回放范围)、G06(OAuth)两张 open 票待推进;
-     开源发布形态 fog 已由 G04 毕业收敛。 -->
+<!-- 当前无未票化 fog。v1 frontier 已清空:G05(回放范围)、G06(OAuth)均于
+     2026-07-20 closed;开源发布形态 fog 已由 G04 毕业收敛。v1 图走通,hand off 施工。 -->
 
 <!-- 已毕业的 fog(各归其票):
   - dashboard 监控什么给谁看 → G02。
@@ -62,4 +62,7 @@ created: 2026-07-20
 
 <!-- 图止于 destination;此处记被有意识排除的工作,闭票不进 Decisions so far。 -->
 
-- (暂无)
+- [G06 OAuth 登录路径](tickets/G06-oauth-login-path.md) — 判 v1 out-of-scope(2026-07-20
+  与用户确认):22 预设里仅 `openai-codex` 为 OAuth-only,漏掉 = 21/22 可用;双模供应商
+  key 路径已覆盖,OAuth 仅可选增强。回调 server/device flow/token 迁移成本对 v1 非必要。
+  作为后续独立 effort 再开新图(destination redrawn 时再 resumption)。

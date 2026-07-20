@@ -1,10 +1,11 @@
 ---
 id: G06
 type: grilling
-status: open
-assignee:
+status: closed
+assignee: agent
 blocked-by: []
 created: 2026-07-20
+resolved: 2026-07-20
 title: OAuth 登录路径(openai-codex / 双模供应商)
 ---
 
@@ -27,3 +28,16 @@ G03 本期只做 key 路径,OAuth 留后。本票定 OAuth 登录路径:
 - 不阻塞 destination 当前阶段(key 路径覆盖绝大多数用户);是「补 openai-codex 这类
   OAuth-only 供应商」的后续增强。
 - HITL grilling 票;可能衍生 research 票(SDK `login`/`AuthInteraction` 形态)。
+
+## Resolution
+
+2026-07-20 grilling 与用户确认(用户「按你推荐」):**G06 判为 v1 out-of-scope**,关票。
+
+**理由**:当前 v1 destination(开源、脱离 pi TUI、多会话/持久化/真实监控)不要求全 22
+供应商。R01 的 22 预设里仅 `openai-codex` 为 OAuth-only(漏掉 = 21/22 可用);`anthropic`/
+`xai`/`github-copilot` 双模,key 路径已覆盖,OAuth 仅可选增强。OAuth 的真实成本(回调
+server 端口冲突 / device flow 研究 / token 跨设备迁移设计)对开源 v1 是非必要负担。
+
+**去向**:作为后续独立 effort 再开新图(destination redrawn 时再 resumption)。v1 施工不
+阻塞于此。关票不进 Decisions so far(范围边界非路线步骤),只进 map「Out of scope」。
+
