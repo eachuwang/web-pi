@@ -177,6 +177,11 @@ export function App() {
   const streamingRef = useRef(false);
   streamingRef.current = streaming;
   const prevSteerRef = useRef<string[]>([]);
+  // Set when a queued steer is consumed (queue.steer non-empty → empty while
+  // streaming). The next `message_start` (assistant) opens a FRESH assistant
+  // bubble for the steer's reply instead of merging into the previous reply —
+  // so a consumed steer reads like a normal back-and-forth [user][assistant].
+  const pendingSteerBubbleRef = useRef(false);
   const [input, setInput] = useState("");
   const [session, setSession] = useState<{ id: string; cwd: string } | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -342,6 +347,11 @@ export function App() {
         listRef.current = [...listRef.current, { kind: "assistant", id: nextId(), segs, streaming: true }];
       }
       setQueue({ steer: snap.queue.steering, follow: snap.queue.followUp });
+      // G05: seed the steer baseline from the snapshot so a steer that's
+      // consumed right after reconnect (prevSteer non-empty → empty) is
+      // detected by the synchronous queue_update handler — without this,
+      // prevSteerRef stays [] and the non-empty→empty transition is missed.
+      prevSteerRef.current = [...snap.queue.steering];
       bump();
       void fetchStats();
       void fetchUsage();
@@ -406,6 +416,25 @@ export function App() {
           bump();
           break;
         }
+        case "message_start": {
+          // A new assistant message is starting mid-run. The FIRST one follows
+          // agent_start's pre-created entry (pendingSteerBubbleRef is false →
+          // reuse it, same as before). A subsequent one means a queued steer was
+          // just consumed: pendingSteerBubbleRef was set by the queue_update
+          // handler → open a FRESH bubble so the steer's reply stands alone
+          // (thinking/text/tool) instead of merging into the previous reply.
+          // Tool-call continuations (message_start after a toolResult, not after
+          // a consumed steer) keep the flag false → stay in the same bubble.
+          const role = (e as { message?: { role?: string } }).message?.role;
+          if (role === "assistant" && pendingSteerBubbleRef.current) {
+            pendingSteerBubbleRef.current = false;
+            const prev = curAssistant();
+            if (prev) prev.streaming = false;
+            listRef.current = [...listRef.current, { kind: "assistant", id: nextId(), segs: [], streaming: true }];
+            bump();
+          }
+          break;
+        }
         case "message_update": {
           const ame = e.assistantMessageEvent as { type: string; delta?: string } | undefined;
           const a = curAssistant();
@@ -463,7 +492,28 @@ export function App() {
         }
         case "queue_update": {
           const q = e as { steering?: string[]; followUp?: string[] };
-          setQueue({ steer: q.steering ?? [], follow: q.followUp ?? [] });
+          const nowSteer = q.steering ?? [];
+          const prevSteer = prevSteerRef.current;
+          // Steer consumed: the running turn picked up a queued steer
+          // (prevSteer non-empty → now empty while streaming). Surface the
+          // consumed steer texts as USER entries SYNCHRONOUSLY here (not in a
+          // deferred effect) so they land BEFORE the steer's reply streams —
+          // the chat then reads like a normal back-and-forth
+          // [user steer][assistant reply]. Also flag the next assistant
+          // message_start to open a fresh bubble (see message_start handler).
+          // Previously this was an async useEffect pushing a "正在回复排队消息…"
+          // system line, which (a) landed AFTER the reply (race → misplaced)
+          // and (b) left the reply merged into the previous bubble — so the
+          // user saw only the system prompt and no visible reply.
+          if (prevSteer.length > 0 && nowSteer.length === 0 && streamingRef.current) {
+            for (const t of prevSteer) {
+              listRef.current = [...listRef.current, { kind: "user", id: nextId(), text: t }];
+            }
+            pendingSteerBubbleRef.current = true;
+            bump();
+          }
+          prevSteerRef.current = nowSteer;
+          setQueue({ steer: nowSteer, follow: q.followUp ?? [] });
           break;
         }
         case "compaction_start":
@@ -508,27 +558,16 @@ export function App() {
     reconnectKey,
   );
 
-  // Steer-consumed status: when a pending steer is picked up by the running
-  // turn (queue.steer transitions non-empty → empty while streaming), surface a
-  // status line in the MAIN CHAT so the user knows the model is now replying to
-  // the queued message — instead of the queue silently emptying and the chat
-  // showing nothing ("no idea if it's working on the new or old message, or
-  // hung"). Appending a system entry mid-stream is safe now that curAssistant()
-  // scans back past trailing non-assistant entries.
+  // Reset the steer baseline on session switch so a stale non-empty queue from
+  // the previous session doesn't falsely read as "consumed" by the synchronous
+  // queue_update handler. (The steer-consumed UX itself — appending the
+  // consumed steer as a user entry + opening a fresh reply bubble — now lives
+  // in the queue_update event handler above, so it lands before the reply
+  // streams, not in a deferred race.)
   useEffect(() => {
-    // Reset the steer baseline on session switch so a stale non-empty queue
-    // from the previous session doesn't falsely read as "consumed".
     prevSteerRef.current = [];
+    pendingSteerBubbleRef.current = false;
   }, [activeSessionId]);
-  useEffect(() => {
-    const prev = prevSteerRef.current;
-    const now = queue.steer;
-    if (prev.length > 0 && now.length === 0 && streamingRef.current) {
-      pushSystem("正在回复排队消息…", "a");
-      bump();
-    }
-    prevSteerRef.current = now;
-  }, [queue.steer]);
 
   const refreshModels = useCallback(() => {
     void getModels()
@@ -577,12 +616,12 @@ export function App() {
     stickBottom.current = true;
     // While the model is streaming, a new message is a STEER: it's queued
     // (streamingBehavior:"steer") and shown in the dashboard Queue panel via
-    // queue_update — NOT appended to the chat list. Appending it here would
-    // both (a) show the queued message in the main dialog (Bug 1) and (b)
-    // make curAssistant() return null (it used to check only the last entry)
-    // so thinking/text deltas stopped refreshing the in-flight assistant
-    // (Bug 2). When not streaming, the message is a normal prompt → the
-    // server emits agent_start, which appends a fresh assistant entry.
+    // queue_update — NOT appended to the chat list here. It's appended as a
+    // USER entry LATER, synchronously in the queue_update handler, the moment
+    // the running turn consumes it (prevSteer non-empty → empty) — so it lands
+    // just before the steer's reply and reads like a normal back-and-forth.
+    // When not streaming, the message is a normal prompt → appended here, and
+    // the server emits agent_start, which appends a fresh assistant entry.
     if (!streaming) {
       listRef.current = [...listRef.current, { kind: "user", id: nextId(), text }];
     }

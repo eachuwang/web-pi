@@ -1158,7 +1158,7 @@ header.app {
 }
 .stat .v {
   font-size: 18px;
-  font-family: Georgia, serif;
+  font-family: var(--mono);
 }
 .kv {
   font-family: var(--mono);
