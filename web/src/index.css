@@ -1650,11 +1650,25 @@ header.app {
 .sd-add-model:hover { background: rgba(184, 134, 11, 0.08); }
 .sd-model-item {
   display: flex;
-  gap: 6px;
-  align-items: center;
-  margin-bottom: 6px;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
 }
+.sd-model-id-row { display: flex; gap: 6px; align-items: center; }
 .sd-model-item .sd-input { flex: 1; }
+/* per-model ctx/maxTokens overrides (custom providers only) */
+.sd-model-limits { display: flex; gap: 10px; padding-left: 2px; }
+.sd-mini-field { display: flex; align-items: center; gap: 6px; }
+.sd-mini-field > span {
+  font-size: 11px; color: var(--dim); text-transform: lowercase;
+  letter-spacing: 0.02em; white-space: nowrap;
+}
+.sd-mini-field .ts-input { width: 150px; }
+.sd-mini-field .ts-unit { width: 18px; height: 24px; font-size: 11px; }
 .sd-model-del {
   border: 1px solid var(--line);
   background: var(--bg);

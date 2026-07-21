@@ -61,13 +61,13 @@ export async function switchModel(
 export async function setThinkingLevel(
   level: string,
   sessionId?: string,
-): Promise<{ ok: boolean; error?: string; level?: string }> {
+): Promise<{ ok: boolean; error?: string; level?: string; available?: string[] }> {
   const res = await fetch(`${API_BASE}/api/thinking${sid(sessionId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ level }),
   });
-  return (await res.json()) as { ok: boolean; error?: string; level?: string };
+  return (await res.json()) as { ok: boolean; error?: string; level?: string; available?: string[] };
 }
 
 export async function abortRun(sessionId?: string): Promise<{ aborted: boolean }> {
@@ -102,6 +102,9 @@ export type SessionStat = {
   cost: number;
   contextUsage?: ContextUsage;
   pendingToolCalls: string[]; // G02: in-flight tool ids (marked running in Queue panel)
+  thinkingLevel?: string; // actual (post-clamp) thinking level for the current model
+  availableThinkingLevels?: string[]; // levels the current model supports (dropdown filter)
+  supportsThinking?: boolean;
 };
 
 export async function getStats(sessionId?: string): Promise<SessionStat> {
@@ -274,14 +277,17 @@ export async function disposeSession(
 
 // ---- Settings (D01/G03: self-contained model provider config) ----
 
+export type ModelLimits = { contextWindow?: number; maxTokens?: number };
+
 export type SettingsProvider = {
   id: string;
   name?: string;
   baseUrl?: string;
   api?: string; // wire format for custom providers (KnownApi)
   models?: string[]; // model ids this provider offers
-  contextWindow?: number;
-  maxTokens?: number;
+  contextWindow?: number; // default input ctx for models w/o an explicit override
+  maxTokens?: number; // default max output for models w/o an explicit override
+  modelConfig?: Record<string, ModelLimits>; // per-model ctx/maxTokens overrides (custom)
   custom?: boolean;
   enabled?: boolean;
   apiKey?: string; // write-only: sent on PUT, never returned by GET
@@ -325,6 +331,7 @@ export async function testProvider(input: {
   models?: string[];
   contextWindow?: number;
   maxTokens?: number;
+  modelConfig?: Record<string, ModelLimits>;
   custom?: boolean;
 }): Promise<{
   ok: boolean;
@@ -362,6 +369,7 @@ export type Snapshot = {
   cwd: string;
   model: { id: string; provider: string } | null;
   thinking: string;
+  availableThinkingLevels?: string[];
   streaming: boolean;
   messages: HistMessage[];
   inProgress: { segments: HistSeg[] } | null;

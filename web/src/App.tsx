@@ -174,6 +174,12 @@ export function App() {
   const [model, setModel] = useState<{ id: string; provider: string } | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [thinking, setThinking] = useState<string>("off");
+  // Levels the current model supports (SDK clamps to this). Drives the thinking
+  // dropdown filter — a reasoning:false model (custom-provider models) only
+  // supports "off", so the dropdown offers just that instead of letting the
+  // user pick a level that silently clamps back (the "shows med / backend off"
+  // desync). null = not yet loaded → show the full ladder.
+  const [availableThinking, setAvailableThinking] = useState<string[] | null>(null);
   const [queue, setQueue] = useState<{ steer: string[]; follow: string[] }>({ steer: [], follow: [] });
   const [stats, setStats] = useState<SessionStat | null>(null);
   const [usage, setUsage] = useState<UsageData | null>(null);
@@ -209,7 +215,14 @@ export function App() {
 
   const fetchStats = async () => {
     try {
-      setStats(await getStats(activeSessionId ?? undefined));
+      const st = await getStats(activeSessionId ?? undefined);
+      setStats(st);
+      // Sync thinking dropdown to the model's actual (clamped) level + the
+      // levels it supports. fetchStats runs on model switch (setModel may clamp
+      // thinking to the new model's supported ladder) + session_init + agent
+      // events — keeps the dropdown honest about what the SDK will accept.
+      if (st.thinkingLevel) setThinking(st.thinkingLevel);
+      if (Array.isArray(st.availableThinkingLevels)) setAvailableThinking(st.availableThinkingLevels);
     } catch (e) {
       pushSystem(`stats: ${String(e)}`, "err");
     }
@@ -283,6 +296,7 @@ export function App() {
       setSession({ id: snap.sessionId, cwd: snap.cwd });
       if (snap.model) setModel(snap.model);
       if (snap.thinking) setThinking(snap.thinking);
+      if (Array.isArray(snap.availableThinkingLevels)) setAvailableThinking(snap.availableThinkingLevels);
       setStreaming(snap.streaming);
       setConnected(true);
       listRef.current = snap.messages.map(mapHistory);
@@ -328,12 +342,14 @@ export function App() {
             cwd?: string;
             model?: { id: string; provider: string } | null;
             thinking?: string;
+            availableThinkingLevels?: string[];
             streaming?: boolean;
           };
           setSession({ id: s.sessionId ?? "", cwd: s.cwd ?? "" });
           setActiveSessionId(s.sessionId ?? null);
           if (s.model) setModel(s.model);
           if (s.thinking) setThinking(s.thinking);
+          if (Array.isArray(s.availableThinkingLevels)) setAvailableThinking(s.availableThinkingLevels);
           setStreaming(Boolean(s.streaming));
           setConnected(true);
           // G05: if a turn is in progress on (re)connect, restore the full
@@ -540,13 +556,22 @@ export function App() {
     if (r.ok && r.model) {
       setModel(r.model);
       pushSystem(`model ▸ ${r.model.id}`, "ok");
+      // Refresh stats so the dashboard's Context panel reflects the new model's
+      // contextWindow/maxTokens immediately (per-model limits — switching models
+      // switches the registered limits; without this the panel shows stale ctx).
+      void fetchStats();
     } else pushSystem(`model: ${r.error ?? "failed"}`, "err");
   };
   const onThinkingChange = async (level: string) => {
     const r = await setThinkingLevel(level, activeSessionId ?? undefined);
     if (r.ok) {
-      setThinking(level);
-      pushSystem(`thinking ▸ ${level}`, "ok");
+      // Use the ACTUAL level the SDK clamped to (a reasoning:false model clamps
+      // any level to "off"), not the optimistic requested one — otherwise the
+      // dropdown shows the requested level while session_init reports the
+      // clamped value.
+      setThinking(r.level ?? level);
+      if (Array.isArray(r.available)) setAvailableThinking(r.available);
+      pushSystem(`thinking ▸ ${r.level ?? level}`, "ok");
     } else pushSystem(`thinking: ${r.error ?? "failed"}`, "err");
   };
   const doSwitch = async (newCwd: string, sessionPath?: string) => {
@@ -878,7 +903,10 @@ export function App() {
                 onChange={(e) => void onThinkingChange(e.target.value)}
                 disabled={streaming}
               >
-                {THINK_OPTS.map((o) => (
+                {(availableThinking
+                  ? THINK_OPTS.filter((o) => availableThinking.includes(o.v))
+                  : THINK_OPTS
+                ).map((o) => (
                   <option key={o.v} value={o.v}>
                     {o.l}
                   </option>

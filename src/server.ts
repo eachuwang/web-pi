@@ -48,6 +48,7 @@ import {
   loadSettings,
   loadUsage,
   recordUsage,
+  resolveModelLimits,
   saveCredentials,
   saveSettings,
   type ProviderEntry,
@@ -255,6 +256,8 @@ app.get("/api/health", (c) => {
     hasModel: Boolean(m),
     model: m ? { id: m.id, provider: m.provider } : null,
     thinking: s.thinkingLevel,
+    availableThinkingLevels: s.getAvailableThinkingLevels(),
+    supportsThinking: s.supportsThinking(),
   });
 });
 
@@ -262,8 +265,16 @@ app.get("/api/stats", (c) => {
   const s = rt(c).session;
   // G02: surface in-flight tools alongside the per-session cost/tokens so the
   // dashboard's Queue panel can mark pendingToolCalls as running without a
-  // separate snapshot fetch.
-  return c.json({ ...s.getSessionStats(), pendingToolCalls: [...s.state.pendingToolCalls] });
+  // separate snapshot fetch. Also surface the actual thinkingLevel + the levels
+  // the current model supports — fetched on model switch / session switch so the
+  // thinking dropdown stays in sync with what the SDK clamped to.
+  return c.json({
+    ...s.getSessionStats(),
+    pendingToolCalls: [...s.state.pendingToolCalls],
+    thinkingLevel: s.thinkingLevel,
+    availableThinkingLevels: s.getAvailableThinkingLevels(),
+    supportsThinking: s.supportsThinking(),
+  });
 });
 
 // G02: cross-session cost odometer — total spend across every session ever,
@@ -327,8 +338,19 @@ app.post("/api/thinking", async (c) => {
   if (!level || !THINKING_LEVELS.includes(level as ThinkingLevel)) {
     return c.json({ ok: false, error: "invalid level" }, 400);
   }
-  rt(c).session.setThinkingLevel(level as ThinkingLevel);
-  return c.json({ ok: true, level });
+  const s = rt(c).session;
+  s.setThinkingLevel(level as ThinkingLevel);
+  // The SDK clamps the level to what the current model supports — a
+  // reasoning:false model (e.g. a custom-provider model) clamps any level to
+  // "off". Return the ACTUAL level (re-read after set), not the requested one,
+  // so the frontend dropdown syncs to reality. Previously we returned the
+  // requested level, the frontend showed it optimistically, while session_init
+  // reported the clamped value → "shows med, backend says off" desync.
+  return c.json({
+    ok: true,
+    level: s.thinkingLevel,
+    available: s.getAvailableThinkingLevels(),
+  });
 });
 
 app.post("/api/prompt", async (c) => {
@@ -564,6 +586,7 @@ app.get("/api/settings", (c) => {
     models: p.models ?? [],
     contextWindow: p.contextWindow,
     maxTokens: p.maxTokens,
+    modelConfig: p.modelConfig ?? {},
     custom: p.custom,
     enabled: p.enabled !== false,
     hasKey: Boolean(credsState[p.id]),
@@ -579,17 +602,32 @@ app.put("/api/settings", async (c) => {
     providers?: Array<ProviderEntry & { apiKey?: string }>;
     maxSessions?: number;
   }>();
-  const providers: ProviderEntry[] = (body.providers ?? []).map((p) => ({
-    id: String(p.id),
-    name: p.name ? String(p.name) : undefined,
-    baseUrl: p.baseUrl ? String(p.baseUrl) : undefined,
-    api: p.api ? String(p.api) : undefined,
-    models: Array.isArray(p.models) ? p.models.map(String).filter(Boolean) : [],
-    contextWindow: typeof p.contextWindow === "number" ? p.contextWindow : undefined,
-    maxTokens: typeof p.maxTokens === "number" ? p.maxTokens : undefined,
-    custom: Boolean(p.custom),
-    enabled: p.enabled !== false,
-  }));
+  const providers: ProviderEntry[] = (body.providers ?? []).map((p) => {
+    // Per-model ctx/maxTokens overrides: drop blanks/zeroes so unset fields fall
+    // back to the provider default at registration time.
+    const mc: Record<string, { contextWindow?: number; maxTokens?: number }> = {};
+    if (p.modelConfig && typeof p.modelConfig === "object") {
+      for (const [mid, ml] of Object.entries(p.modelConfig)) {
+        if (!mid) continue;
+        const cfg = ml as { contextWindow?: number; maxTokens?: number };
+        const ctx = typeof cfg.contextWindow === "number" && cfg.contextWindow > 0 ? cfg.contextWindow : undefined;
+        const max = typeof cfg.maxTokens === "number" && cfg.maxTokens > 0 ? cfg.maxTokens : undefined;
+        if (ctx || max) mc[mid] = { ...(ctx ? { contextWindow: ctx } : {}), ...(max ? { maxTokens: max } : {}) };
+      }
+    }
+    return {
+      id: String(p.id),
+      name: p.name ? String(p.name) : undefined,
+      baseUrl: p.baseUrl ? String(p.baseUrl) : undefined,
+      api: p.api ? String(p.api) : undefined,
+      models: Array.isArray(p.models) ? p.models.map(String).filter(Boolean) : [],
+      contextWindow: typeof p.contextWindow === "number" ? p.contextWindow : undefined,
+      maxTokens: typeof p.maxTokens === "number" ? p.maxTokens : undefined,
+      modelConfig: Object.keys(mc).length ? mc : undefined,
+      custom: Boolean(p.custom),
+      enabled: p.enabled !== false,
+    };
+  });
   const maxSessions =
     typeof body.maxSessions === "number" && body.maxSessions >= 1 && body.maxSessions <= 16
       ? Math.floor(body.maxSessions)
@@ -631,6 +669,7 @@ app.post("/api/settings/test", async (c) => {
     models?: string[];
     contextWindow?: number;
     maxTokens?: number;
+    modelConfig?: Record<string, { contextWindow?: number; maxTokens?: number }>;
     custom?: boolean;
   }>();
   const providerId = body.providerId?.trim();
@@ -639,22 +678,32 @@ app.post("/api/settings/test", async (c) => {
     if (body.custom && body.baseUrl) {
       const api = body.api || "openai-completions";
       const modelIds = body.models && body.models.length ? body.models : [providerId];
-      const ctx = body.contextWindow ?? 128000;
-      const maxTok = body.maxTokens ?? 131072; // max OUTPUT (max_completion_tokens), default 128K (#7)
+      // Per-model limits (same resolution as applySettings): each model gets
+      // its own ctx/maxTokens so a multi-model custom provider doesn't share
+      // one cap across models with different windows.
+      const providerLike = {
+        contextWindow: body.contextWindow,
+        maxTokens: body.maxTokens,
+        modelConfig: body.modelConfig,
+      };
+      const limits = modelIds.map((id) => ({
+        id,
+        ...resolveModelLimits(providerLike, id),
+      }));
       modelRuntime.registerProvider(providerId, {
         name: providerId,
         baseUrl: body.baseUrl,
         authHeader: true,
         api,
-        models: modelIds.map((id) => ({
+        models: limits.map(({ id, contextWindow, maxTokens }) => ({
           id,
           name: id,
           api,
           reasoning: false,
           input: ["text"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: ctx,
-          maxTokens: maxTok,
+          contextWindow,
+          maxTokens,
         })),
       });
     }
@@ -755,6 +804,7 @@ app.get("/api/snapshot", (c) => {
     cwd: rt().cwd,
     model: s.model ? { id: s.model.id, provider: s.model.provider } : null,
     thinking: s.thinkingLevel,
+    availableThinkingLevels: s.getAvailableThinkingLevels(),
     streaming: s.isStreaming,
     messages,
     inProgress,
@@ -786,6 +836,7 @@ app.get("/api/events", (c) => {
         cwd: rt().cwd,
         model: m ? { id: m.id, provider: m.provider } : null,
         thinking: s.thinkingLevel,
+        availableThinkingLevels: s.getAvailableThinkingLevels(),
         streaming: s.isStreaming,
       });
       unsub = s.subscribe((event) => {

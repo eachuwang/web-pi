@@ -71,6 +71,27 @@ export function SettingsDrawer({
     setDirty(true);
   }
 
+  // Per-model ctx/maxTokens override: n=0 clears the field so it falls back to
+  // the provider default. Keyed by model id — empty ids (a fresh blank row) hold
+  // no override until the user types an id.
+  function setModelLimit(id: string, modelId: string, field: "contextWindow" | "maxTokens", n: number) {
+    if (!modelId) return;
+    setRows((rs) =>
+      rs.map((r) => {
+        if (r.id !== id) return r;
+        const mc = { ...(r.modelConfig ?? {}) };
+        const cur = mc[modelId] ?? {};
+        const next = { ...cur };
+        if (n > 0) next[field] = n;
+        else delete next[field];
+        if (next.contextWindow || next.maxTokens) mc[modelId] = next;
+        else delete mc[modelId];
+        return { ...r, modelConfig: mc };
+      }),
+    );
+    setDirty(true);
+  }
+
   function addPreset(presetId: string) {
     if (rows.some((r) => r.id === presetId)) return;
     const p = PRESET_BY_ID.get(presetId);
@@ -114,6 +135,7 @@ export function SettingsDrawer({
       models: r.custom ? r.models : undefined,
       contextWindow: r.custom ? r.contextWindow : undefined,
       maxTokens: r.custom ? r.maxTokens : undefined,
+      modelConfig: r.custom ? r.modelConfig : undefined,
       custom: r.custom,
     });
     if (res.ok && res.models) {
@@ -208,6 +230,7 @@ export function SettingsDrawer({
               key={r.id}
               row={r}
               onChange={(p) => patch(r.id, p)}
+              onModelLimit={(mid, field, n) => setModelLimit(r.id, mid, field, n)}
               onRemove={() => removeRow(r.id)}
               onFetch={() => void fetchModels(r)}
               onToggleExpand={() => patch(r.id, { expanded: !r.expanded })}
@@ -248,12 +271,14 @@ export function SettingsDrawer({
 function ProviderRow({
   row,
   onChange,
+  onModelLimit,
   onRemove,
   onFetch,
   onToggleExpand,
 }: {
   row: Row;
   onChange: (p: Partial<Row>) => void;
+  onModelLimit: (modelId: string, field: "contextWindow" | "maxTokens", n: number) => void;
   onRemove: () => void;
   onFetch: () => void;
   onToggleExpand: () => void;
@@ -321,11 +346,11 @@ function ProviderRow({
             </select>
           </label>
           <label className="sd-field">
-            <span>context window (input tokens)</span>
+            <span>default context window (input tokens) — for models without an explicit override</span>
             <TokenSizeInput value={row.contextWindow} onChange={(n) => onChange({ contextWindow: n })} placeholder="e.g. 128k" />
           </label>
           <label className="sd-field">
-            <span>max output tokens</span>
+            <span>default max output tokens — for models without an explicit override</span>
             <TokenSizeInput value={row.maxTokens} onChange={(n) => onChange({ maxTokens: n })} placeholder="e.g. 128k" />
           </label>
         </>
@@ -361,25 +386,50 @@ function ProviderRow({
             )}
             {(row.models ?? []).map((mid, i) => (
               <div className="sd-model-item" key={i}>
-                <input
-                  className="sd-input"
-                  list={`models-${row.id}`}
-                  value={mid}
-                  placeholder={preset?.exampleModelId || "model id"}
-                  onChange={(e) => {
-                    const next = [...(row.models ?? [])];
-                    next[i] = e.target.value;
-                    onChange({ models: next });
-                  }}
-                />
-                <button
-                  className="sd-model-del"
-                  type="button"
-                  title="remove model"
-                  onClick={() => onChange({ models: (row.models ?? []).filter((_, j) => j !== i) })}
-                >
-                  ✕
-                </button>
+                <div className="sd-model-id-row">
+                  <input
+                    className="sd-input"
+                    list={`models-${row.id}`}
+                    value={mid}
+                    placeholder={preset?.exampleModelId || "model id"}
+                    onChange={(e) => {
+                      const next = [...(row.models ?? [])];
+                      const oldMid = next[i];
+                      const newMid = e.target.value;
+                      next[i] = newMid;
+                      // Re-key per-model limits so renaming a model keeps its
+                      // ctx/maxTokens override (only when both ids are non-empty;
+                      // clearing the id leaves the override under the old key,
+                      // harmless and re-attached if the id is restored).
+                      let mc = row.modelConfig;
+                      if (mc && oldMid && newMid && mc[oldMid]) {
+                        const { [oldMid]: v, ...rest } = mc;
+                        mc = { ...rest, [newMid]: v };
+                      }
+                      onChange({ models: next, ...(mc !== row.modelConfig ? { modelConfig: mc } : {}) });
+                    }}
+                  />
+                  <button
+                    className="sd-model-del"
+                    type="button"
+                    title="remove model"
+                    onClick={() => onChange({ models: (row.models ?? []).filter((_, j) => j !== i) })}
+                  >
+                    ✕
+                  </button>
+                </div>
+                {row.custom && mid && (
+                  <div className="sd-model-limits">
+                    <label className="sd-mini-field">
+                      <span>ctx</span>
+                      <TokenSizeInput value={row.modelConfig?.[mid]?.contextWindow} onChange={(n) => onModelLimit(mid, "contextWindow", n)} placeholder="default" />
+                    </label>
+                    <label className="sd-mini-field">
+                      <span>max out</span>
+                      <TokenSizeInput value={row.modelConfig?.[mid]?.maxTokens} onChange={(n) => onModelLimit(mid, "maxTokens", n)} placeholder="default" />
+                    </label>
+                  </div>
+                )}
               </div>
             ))}
             <datalist id={`models-${row.id}`}>

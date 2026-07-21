@@ -18,6 +18,16 @@ const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const CREDS_PATH = join(CONFIG_DIR, "credentials.json");
 const USAGE_PATH = join(CONFIG_DIR, "usage.json");
 
+/** Per-model limit override for a custom provider. Keys are model ids.
+ * When the provider is registered, each model's effective limits resolve as:
+ *   modelConfig[id].contextWindow ?? provider.contextWindow ?? 128000
+ *   modelConfig[id].maxTokens    ?? provider.maxTokens    ?? 8192
+ * This keeps contextWindow (input) and maxTokens (output cap) per-model so
+ * switching models inside one provider picks up the right limits — a 1M-context
+ * model and a 200K model under the same custom provider no longer share one cap
+ * (the bug: shared provider-level limits applied to every model). */
+export type ModelLimits = { contextWindow?: number; maxTokens?: number };
+
 /** A provider the user has configured. `custom` entries need registerProvider. */
 export type ProviderEntry = {
   id: string; // SDK providerId
@@ -25,11 +35,30 @@ export type ProviderEntry = {
   baseUrl?: string; // only for custom (non-builtin) providers
   api?: string; // wire format for custom providers (KnownApi, e.g. "openai-completions") — wires builtin streaming
   models?: string[]; // model ids this provider offers (custom: registered as the provider's catalog)
-  contextWindow?: number; // custom provider model context window
-  maxTokens?: number; // custom provider model max output tokens
+  contextWindow?: number; // DEFAULT input context window for models w/o an explicit per-model override
+  maxTokens?: number; // DEFAULT max output tokens for models w/o an explicit per-model override
+  modelConfig?: Record<string, ModelLimits>; // per-model ctx/maxTokens overrides (custom providers)
   custom?: boolean; // true → registerProvider(id, {baseUrl, api, models}) on apply
   enabled?: boolean; // default true; false = skip
 };
+
+/** Structural subset of ProviderEntry carrying the limit-related fields.
+ * Lets callers (test endpoint) resolve limits from a request body without
+ * fabricating a full ProviderEntry. */
+export type ModelLimitSource = {
+  contextWindow?: number;
+  maxTokens?: number;
+  modelConfig?: Record<string, ModelLimits>;
+};
+
+/** Resolve a model's effective limits: per-model override → provider default → global. */
+export function resolveModelLimits(p: ModelLimitSource, modelId: string): { contextWindow: number; maxTokens: number } {
+  const mc = p.modelConfig?.[modelId];
+  return {
+    contextWindow: mc?.contextWindow ?? p.contextWindow ?? 128000,
+    maxTokens: mc?.maxTokens ?? p.maxTokens ?? 8192,
+  };
+}
 
 export type Settings = {
   providers: ProviderEntry[];
@@ -204,25 +233,28 @@ export async function applySettings(
       if (p.custom && p.baseUrl) {
         const api = p.api || "openai-completions";
         const modelIds = p.models && p.models.length ? p.models : [p.id];
-        const ctx = p.contextWindow ?? 128000;
-        // maxTokens = MAX OUTPUT tokens (max_completion_tokens), NOT the input
+        // Per-model limits: resolve each model's ctx/maxTokens via its own
+        // override → provider default → global. Registering each model with its
+        // own limits means setModel(model) picks up the right caps per model —
+        // a 1M ctx model vs a 200K model under one provider no longer share one
+        // value. maxTokens is MAX OUTPUT (max_completion_tokens), NOT the input
         // context window — decoupled so a 1M input window doesn't blow past an
-        // endpoint's output cap (e.g. GLM caps max_completion_tokens at 131072).
-        const maxTok = p.maxTokens ?? 8192;
+        // endpoint's output cap (e.g. GLM caps at 131072).
+        const limits = modelIds.map((id) => ({ id, ...resolveModelLimits(p, id) }));
         mr.registerProvider(p.id, {
           name: p.name ?? p.id,
           baseUrl: p.baseUrl,
           authHeader: true,
           api,
-          models: modelIds.map((id) => ({
+          models: limits.map(({ id, contextWindow, maxTokens }) => ({
             id,
             name: id,
             api,
             reasoning: false,
             input: ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: ctx,
-            maxTokens: maxTok,
+            contextWindow,
+            maxTokens,
           })),
         });
         registeredCustom.add(p.id);
