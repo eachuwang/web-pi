@@ -171,6 +171,12 @@ export function App() {
   // EventSource to reopen (banner's reconnect action) without switching session.
   const [stalled, setStalled] = useState(false);
   const [reconnectKey, setReconnectKey] = useState(0);
+  // Ref mirror of `streaming` so effects (steer-consumed status) can read the
+  // current value without re-running on every streaming toggle, and a ref of
+  // the previous steer queue to detect consumption.
+  const streamingRef = useRef(false);
+  streamingRef.current = streaming;
+  const prevSteerRef = useRef<string[]>([]);
   const [input, setInput] = useState("");
   const [session, setSession] = useState<{ id: string; cwd: string } | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -201,9 +207,19 @@ export function App() {
   const [slashIndex, setSlashIndex] = useState(0);
 
   const curAssistant = (): Extract<Entry, { kind: "assistant" }> | null => {
+    // Scan back for the last ASSISTANT entry — NOT just l[length-1]. A trailing
+    // user/system entry (e.g. a steer's rejected pushSystem, or any mid-stream
+    // system note) used to make this return null, which dropped thinking_delta
+    // / text_delta / tool events for the in-flight assistant → "thinking stops
+    // refreshing after sending a new message" (Bug 2). Scanning back keeps the
+    // live assistant as the delta target regardless of trailing non-assistant
+    // entries.
     const l = listRef.current;
-    const last = l[l.length - 1];
-    return last && last.kind === "assistant" ? last : null;
+    for (let i = l.length - 1; i >= 0; i--) {
+      const e = l[i];
+      if (e.kind === "assistant") return e;
+    }
+    return null;
   };
   const lastSegOf = (kind: Seg["kind"]): Seg | undefined => {
     const a = curAssistant();
@@ -379,6 +395,12 @@ export function App() {
           const a = curAssistant();
           if (a) a.streaming = false;
           setStreaming(false);
+          // Surface a pending retry (the SDK will follow with auto_retry_start
+          // carrying the errorMessage). Without this the user sees the reply
+          // stop with no indication whether it's done or retrying.
+          if ((e as { willRetry?: boolean }).willRetry) {
+            pushSystem("回合结束，将自动重试…", "a");
+          }
           void fetchStats();
           void fetchUsage();
           bump();
@@ -445,12 +467,39 @@ export function App() {
           break;
         }
         case "compaction_start":
-          pushSystem("context: compacting", "a");
+          pushSystem("context: compacting…", "a");
           break;
-        case "compaction_end":
-          pushSystem("context: compacted", "ok");
+        case "compaction_end": {
+          const ce = e as { errorMessage?: string; aborted?: boolean; willRetry?: boolean };
+          if (ce.errorMessage) pushSystem(`⚠ 上下文压缩失败：${ce.errorMessage}`, "err");
+          else if (ce.aborted) pushSystem("context: compact aborted", "a");
+          else pushSystem("context: compacted", "ok");
           void fetchStats();
           break;
+        }
+        // Error surfacing (the user wants any error/exception visible in the
+        // main chat, not silent). auto_retry fires when an upstream request
+        // failed and the SDK is retrying; auto_retry_end reports the outcome.
+        case "auto_retry_start": {
+          const ar = e as { attempt?: number; maxAttempts?: number; errorMessage?: string };
+          pushSystem(`⚠ 请求失败，重试中 (${ar.attempt ?? "?"}/${ar.maxAttempts ?? "?"})：${ar.errorMessage ?? ""}`, "err");
+          break;
+        }
+        case "auto_retry_end": {
+          const ar = e as { success?: boolean; attempt?: number; finalError?: string };
+          if (ar.success) pushSystem("已恢复，继续回复", "ok");
+          else pushSystem(`⚠ 重试 ${ar.attempt ?? "?"} 次仍失败：${ar.finalError ?? ""}`, "err");
+          break;
+        }
+        case "message_end": {
+          // A message that ended in error/abort — surface it (auto_retry may
+          // also fire, but a non-retryable stopReason would otherwise vanish).
+          const msg = (e as { message?: { stopReason?: string; errorMessage?: string } }).message;
+          if (msg?.stopReason === "error" || msg?.stopReason === "aborted") {
+            pushSystem(`⚠ 模型中止（${msg.stopReason}）${msg.errorMessage ? `：${msg.errorMessage}` : ""}`, "err");
+          }
+          break;
+        }
       }
     },
     setConnected,
@@ -458,6 +507,28 @@ export function App() {
     (s) => setStalled(s),
     reconnectKey,
   );
+
+  // Steer-consumed status: when a pending steer is picked up by the running
+  // turn (queue.steer transitions non-empty → empty while streaming), surface a
+  // status line in the MAIN CHAT so the user knows the model is now replying to
+  // the queued message — instead of the queue silently emptying and the chat
+  // showing nothing ("no idea if it's working on the new or old message, or
+  // hung"). Appending a system entry mid-stream is safe now that curAssistant()
+  // scans back past trailing non-assistant entries.
+  useEffect(() => {
+    // Reset the steer baseline on session switch so a stale non-empty queue
+    // from the previous session doesn't falsely read as "consumed".
+    prevSteerRef.current = [];
+  }, [activeSessionId]);
+  useEffect(() => {
+    const prev = prevSteerRef.current;
+    const now = queue.steer;
+    if (prev.length > 0 && now.length === 0 && streamingRef.current) {
+      pushSystem("正在回复排队消息…", "a");
+      bump();
+    }
+    prevSteerRef.current = now;
+  }, [queue.steer]);
 
   const refreshModels = useCallback(() => {
     void getModels()
@@ -504,7 +575,17 @@ export function App() {
       }
     }
     stickBottom.current = true;
-    listRef.current = [...listRef.current, { kind: "user", id: nextId(), text }];
+    // While the model is streaming, a new message is a STEER: it's queued
+    // (streamingBehavior:"steer") and shown in the dashboard Queue panel via
+    // queue_update — NOT appended to the chat list. Appending it here would
+    // both (a) show the queued message in the main dialog (Bug 1) and (b)
+    // make curAssistant() return null (it used to check only the last entry)
+    // so thinking/text deltas stopped refreshing the in-flight assistant
+    // (Bug 2). When not streaming, the message is a normal prompt → the
+    // server emits agent_start, which appends a fresh assistant entry.
+    if (!streaming) {
+      listRef.current = [...listRef.current, { kind: "user", id: nextId(), text }];
+    }
     setInput("");
     try {
       const r = await sendPrompt(text, streaming ? "steer" : undefined, activeSessionId ?? undefined);
