@@ -31,6 +31,7 @@ export type ModelInfo = {
   provider: string;
   reasoning: boolean;
   contextWindow: number;
+  maxTokens?: number;
 };
 
 export type SlashCommand = { cmd: string; desc: string; kind: "prompt" | "skill" };
@@ -277,7 +278,12 @@ export async function disposeSession(
 
 // ---- Settings (D01/G03: self-contained model provider config) ----
 
-export type ModelLimits = { contextWindow?: number; maxTokens?: number };
+export type ModelLimits = {
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  source?: "live" | "manual";
+};
 
 export type SettingsProvider = {
   id: string;
@@ -287,7 +293,8 @@ export type SettingsProvider = {
   models?: string[]; // model ids this provider offers
   contextWindow?: number; // default input ctx for models w/o an explicit override
   maxTokens?: number; // default max output for models w/o an explicit override
-  modelConfig?: Record<string, ModelLimits>; // per-model ctx/maxTokens overrides (custom)
+  reasoning?: boolean; // default reasoning flag for models w/o an explicit override
+  modelConfig?: Record<string, ModelLimits>; // per-model ctx/maxTokens/reasoning (custom)
   custom?: boolean;
   enabled?: boolean;
   apiKey?: string; // write-only: sent on PUT, never returned by GET
@@ -321,6 +328,15 @@ export type TestModel = {
   provider: string;
   reasoning: boolean;
   contextWindow: number;
+  maxTokens: number;
+  // per-field "auto-filled from GET /models" flags: true → the value came live
+  // from the endpoint, the UI shows it read-only. false → fallback, the UI
+  // offers a tier dropdown so the user can pick.
+  contextWindowLive: boolean;
+  maxTokensLive: boolean;
+  reasoningLive: boolean;
+  source: "live" | "registered";
+  warning?: string;
 };
 
 export async function testProvider(input: {
@@ -331,6 +347,7 @@ export async function testProvider(input: {
   models?: string[];
   contextWindow?: number;
   maxTokens?: number;
+  reasoning?: boolean;
   modelConfig?: Record<string, ModelLimits>;
   custom?: boolean;
 }): Promise<{

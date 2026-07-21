@@ -8,17 +8,23 @@ import {
   type TestModel,
 } from "../lib/api";
 import { PRESET_PROVIDERS, PRESET_BY_ID } from "../lib/presets";
-import { TokenSizeInput } from "./TokenSizeInput";
 
 // Right-side NON-MODAL drawer (G03-Q6): coexists with chat — no blocking
 // backdrop, chat stays interactive. Configures model providers (D01/G03):
 // presets (fixed baseUrl, key only) + custom (id/baseUrl/api/key/model), per-
 // provider model fetched via "test" (= test connection), max-sessions, reload.
 //
+// ctx / maxTokens / reasoning are NOT user-typed numbers anymore (B2): for
+// custom providers, "fetch models" calls GET {baseUrl}/models and auto-fills
+// context_length / max_completion_tokens / reasoning when the endpoint returns
+// them (OpenRouter, Together, vLLM, …) — those show READ-ONLY. Endpoints that
+// don't surface them (plain OpenAI /models) → a TIER DROPDOWN (128K/200K/1M…)
+// so the user picks a bucket instead of typing a raw token count. Preset
+// providers use the SDK's built-in per-model catalog (read-only, no inputs).
+//
 // Custom providers register with `api` (wire format) — the SDK wires builtin
-// streaming from the api string (getApiProvider), so a custom OpenAI-compatible
-// endpoint with api="openai-completions" actually streams. This mirrors pi's
-// models.json. (R02/R03-era finding: api field is the key; streamSimple not needed.)
+// streaming from the api string, so a custom OpenAI-compatible endpoint with
+// api="openai-completions" actually streams. (streamSimple not needed.)
 
 const API_OPTIONS = [
   { id: "openai-completions", name: "openai-completions (OpenAI chat / most mirrors)" },
@@ -29,12 +35,54 @@ const API_OPTIONS = [
   { id: "pi-messages", name: "pi-messages" },
 ];
 
-// Parse a context-window size with k / M shorthand: "1M" → 1_000_000,
-// "128k" → 128_000, "200000" → 200_000. Returns undefined if unparseable.
+// Context-window tiers (input tokens) and max-output tiers (max_completion_tokens).
+// Replaces raw token number inputs — the user picks a bucket; B2 auto-fill from
+// GET /models shows the live value read-only instead.
+const CTX_TIERS = [128000, 200000, 256000, 512000, 1000000, 1048576];
+const MAX_TIERS = [8192, 16384, 32768, 65536, 131072];
+
 function formatSize(n: number): string {
   if (n >= 1_000_000 && n % 1_000_000 === 0) return `${n / 1_000_000}M`;
+  if (n === 1048576) return "1M";
   if (n >= 1000 && n % 1000 === 0) return `${n / 1000}k`;
   return String(n);
+}
+
+// A <select> of tier buckets. If the current value isn't an exact tier (e.g. a
+// B2 live value like 1048756, or a stale manual value), it's prepended as a
+// custom option so the user sees what's set and can still switch to a tier.
+function TierSelect({
+  value,
+  tiers,
+  onChange,
+  blankLabel = "default",
+}: {
+  value: number | undefined;
+  tiers: number[];
+  onChange: (n: number) => void;
+  blankLabel?: string;
+}) {
+  const hasTier = value != null && tiers.includes(value);
+  return (
+    <select
+      className="sd-input sd-tier"
+      value={value ?? ""}
+      onChange={(e) => {
+        const v = e.target.value;
+        onChange(v === "" ? 0 : Number(v));
+      }}
+    >
+      <option value="">{blankLabel}</option>
+      {!hasTier && value != null && value > 0 && (
+        <option value={value}>{formatSize(value)} (custom)</option>
+      )}
+      {tiers.map((t) => (
+        <option key={t} value={t}>
+          {formatSize(t)}
+        </option>
+      ))}
+    </select>
+  );
 }
 
 type Row = SettingsProvider & { modelOptions?: TestModel[]; testing?: boolean; testErr?: string; expanded?: boolean };
@@ -45,7 +93,8 @@ export function SettingsDrawer({
 }: {
   onClose: () => void;
   onProvidersChanged?: () => void;
-}) {  const [rows, setRows] = useState<Row[]>([]);
+}) {
+  const [rows, setRows] = useState<Row[]>([]);
   const [maxSessions, setMaxSessions] = useState(4);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -58,7 +107,7 @@ export function SettingsDrawer({
         s.providers.map((p) => ({
           ...p,
           apiKey: "",
-          // #6: custom rows load collapsed (compact card); edit expands.
+          // custom rows load collapsed (compact card); edit expands.
           expanded: p.custom ? false : undefined,
         })),
       );
@@ -71,10 +120,10 @@ export function SettingsDrawer({
     setDirty(true);
   }
 
-  // Per-model ctx/maxTokens override: n=0 clears the field so it falls back to
-  // the provider default. Keyed by model id — empty ids (a fresh blank row) hold
-  // no override until the user types an id.
-  function setModelLimit(id: string, modelId: string, field: "contextWindow" | "maxTokens", n: number) {
+  // Write a per-model field into modelConfig. ctx/maxTokens take a number
+  // (0 = clear → falls back to provider/global default); reasoning takes a
+  // boolean. Keyed by model id — empty ids hold no override until typed.
+  function setModelField(id: string, modelId: string, field: "contextWindow" | "maxTokens" | "reasoning", value: number | boolean) {
     if (!modelId) return;
     setRows((rs) =>
       rs.map((r) => {
@@ -82,9 +131,14 @@ export function SettingsDrawer({
         const mc = { ...(r.modelConfig ?? {}) };
         const cur = mc[modelId] ?? {};
         const next = { ...cur };
-        if (n > 0) next[field] = n;
-        else delete next[field];
-        if (next.contextWindow || next.maxTokens) mc[modelId] = next;
+        if (field === "reasoning") {
+          next.reasoning = value as boolean;
+        } else {
+          const n = value as number;
+          if (n > 0) next[field] = n;
+          else delete next[field];
+        }
+        if (next.contextWindow || next.maxTokens || next.reasoning !== undefined) mc[modelId] = next;
         else delete mc[modelId];
         return { ...r, modelConfig: mc };
       }),
@@ -110,12 +164,10 @@ export function SettingsDrawer({
   }
 
   function addCustom() {
-    // give it a temp unique id until the user fills it
     const id = `custom-${rows.length + 1}`;
     setRows((rs) => [
       ...rs,
-      // #7: default max output tokens 128K (131072).
-      { id, custom: true, enabled: true, apiKey: "", baseUrl: "", models: [], api: "openai-completions", contextWindow: 128000, maxTokens: 131072, expanded: true },
+      { id, custom: true, enabled: true, apiKey: "", baseUrl: "", models: [], api: "openai-completions", expanded: true },
     ]);
     setDirty(true);
   }
@@ -135,20 +187,39 @@ export function SettingsDrawer({
       models: r.custom ? r.models : undefined,
       contextWindow: r.custom ? r.contextWindow : undefined,
       maxTokens: r.custom ? r.maxTokens : undefined,
+      reasoning: r.custom ? r.reasoning : undefined,
       modelConfig: r.custom ? r.modelConfig : undefined,
       custom: r.custom,
     });
     if (res.ok && res.models) {
-      patch(r.id, { modelOptions: res.models, testing: false });
+      // B2: auto-fill per-model ctx/maxTokens/reasoning from the live /models
+      // response. Live values are written into modelConfig (source:"live") so
+      // they persist + register correctly, and the UI shows them read-only via
+      // modelOptions' per-field live flags. Non-live fields stay unset → the
+      // tier dropdown handles them.
+      const mc = { ...(r.modelConfig ?? {}) };
+      for (const m of res.models) {
+        const cur = mc[m.id] ?? {};
+        const next = { ...cur, source: "live" as const };
+        if (m.contextWindowLive && m.contextWindow) next.contextWindow = m.contextWindow;
+        if (m.maxTokensLive && m.maxTokens) next.maxTokens = m.maxTokens;
+        if (m.reasoningLive) next.reasoning = m.reasoning;
+        mc[m.id] = next;
+      }
+      patch(r.id, {
+        models: res.models.map((m) => m.id),
+        modelOptions: res.models,
+        modelConfig: mc,
+        testing: false,
+      });
       if (res.source === "live") {
-        setStatus({ kind: "ok", msg: `${r.id}: ${res.models.length} models fetched — key OK` });
+        const filled = res.models.filter((m) => m.contextWindowLive || m.maxTokensLive).length;
+        setStatus({ kind: "ok", msg: `${r.id}: ${res.models.length} models fetched — key OK${filled ? ` · ${filled} auto-filled` : ""}` });
       } else if (res.warning) {
         setStatus({ kind: "err", msg: `${r.id}: ${res.warning}` });
       } else {
         setStatus({ kind: "info", msg: `${r.id}: ${res.models.length} model(s) (registered; key not validated against endpoint)` });
       }
-      // /test registered the provider + set the key on the shared ModelRuntime,
-      // so the new model is now available to the top-bar picker — refresh it.
       onProvidersChanged?.();
     } else {
       patch(r.id, { testing: false, testErr: res.error ?? "fetch failed" });
@@ -158,7 +229,6 @@ export function SettingsDrawer({
 
   async function save() {
     setSaving(true);
-    // validate custom rows have id+baseUrl
     for (const r of rows) {
       if (r.custom && (!r.id || !r.baseUrl)) {
         setStatus({ kind: "err", msg: `custom provider needs id + baseUrl` });
@@ -170,7 +240,6 @@ export function SettingsDrawer({
     setSaving(false);
     if (res.ok) {
       setDirty(false);
-      // #6: collapse custom rows after save so the drawer doesn't hog space.
       setRows((rs) => rs.map((r) => (r.custom ? { ...r, expanded: false } : r)));
       const fail = res.failed?.length ?? 0;
       setStatus({
@@ -230,7 +299,7 @@ export function SettingsDrawer({
               key={r.id}
               row={r}
               onChange={(p) => patch(r.id, p)}
-              onModelLimit={(mid, field, n) => setModelLimit(r.id, mid, field, n)}
+              onModelField={(mid, field, v) => setModelField(r.id, mid, field, v)}
               onRemove={() => removeRow(r.id)}
               onFetch={() => void fetchModels(r)}
               onToggleExpand={() => patch(r.id, { expanded: !r.expanded })}
@@ -271,21 +340,20 @@ export function SettingsDrawer({
 function ProviderRow({
   row,
   onChange,
-  onModelLimit,
+  onModelField,
   onRemove,
   onFetch,
   onToggleExpand,
 }: {
   row: Row;
   onChange: (p: Partial<Row>) => void;
-  onModelLimit: (modelId: string, field: "contextWindow" | "maxTokens", n: number) => void;
+  onModelField: (modelId: string, field: "contextWindow" | "maxTokens" | "reasoning", value: number | boolean) => void;
   onRemove: () => void;
   onFetch: () => void;
   onToggleExpand: () => void;
 }) {
   const preset = !row.custom ? PRESET_BY_ID.get(row.id) : undefined;
   const keyLabel = preset?.envVar ?? "API KEY";
-  // #6: custom rows collapse to a compact card; edit expands.
   const collapsed = row.custom && !row.expanded;
   return (
     <div className={`sd-row${row.custom ? " sd-row-custom" : ""}${collapsed ? " sd-row-collapsed" : ""}`}>
@@ -306,8 +374,6 @@ function ProviderRow({
         <div className="sd-row-summary">
           {row.baseUrl && <span className="sd-summary-bit" title={row.baseUrl}>{row.baseUrl.replace(/^https?:\/\//, "")}</span>}
           <span className="sd-summary-bit">{(row.models ?? []).length || 0} model(s)</span>
-          <span className="sd-summary-bit">{formatSize(row.contextWindow ?? 128000)} ctx</span>
-          <span className="sd-summary-bit">{formatSize(row.maxTokens ?? 131072)} out</span>
         </div>
       )}
 
@@ -345,14 +411,6 @@ function ProviderRow({
               ))}
             </select>
           </label>
-          <label className="sd-field">
-            <span>default context window (input tokens) — for models without an explicit override</span>
-            <TokenSizeInput value={row.contextWindow} onChange={(n) => onChange({ contextWindow: n })} placeholder="e.g. 128k" />
-          </label>
-          <label className="sd-field">
-            <span>default max output tokens — for models without an explicit override</span>
-            <TokenSizeInput value={row.maxTokens} onChange={(n) => onChange({ maxTokens: n })} placeholder="e.g. 128k" />
-          </label>
         </>
       )}
 
@@ -382,62 +440,101 @@ function ProviderRow({
               </button>
             </div>
             {(row.models ?? []).length === 0 && (
-              <div className="sd-hint">no model ids — click “+ model” to add one (or “fetch models” to enumerate).</div>
-            )}
-            {(row.models ?? []).map((mid, i) => (
-              <div className="sd-model-item" key={i}>
-                <div className="sd-model-id-row">
-                  <input
-                    className="sd-input"
-                    list={`models-${row.id}`}
-                    value={mid}
-                    placeholder={preset?.exampleModelId || "model id"}
-                    onChange={(e) => {
-                      const next = [...(row.models ?? [])];
-                      const oldMid = next[i];
-                      const newMid = e.target.value;
-                      next[i] = newMid;
-                      // Re-key per-model limits so renaming a model keeps its
-                      // ctx/maxTokens override (only when both ids are non-empty;
-                      // clearing the id leaves the override under the old key,
-                      // harmless and re-attached if the id is restored).
-                      let mc = row.modelConfig;
-                      if (mc && oldMid && newMid && mc[oldMid]) {
-                        const { [oldMid]: v, ...rest } = mc;
-                        mc = { ...rest, [newMid]: v };
-                      }
-                      onChange({ models: next, ...(mc !== row.modelConfig ? { modelConfig: mc } : {}) });
-                    }}
-                  />
-                  <button
-                    className="sd-model-del"
-                    type="button"
-                    title="remove model"
-                    onClick={() => onChange({ models: (row.models ?? []).filter((_, j) => j !== i) })}
-                  >
-                    ✕
-                  </button>
-                </div>
-                {row.custom && mid && (
-                  <div className="sd-model-limits">
-                    <label className="sd-mini-field">
-                      <span>ctx</span>
-                      <TokenSizeInput value={row.modelConfig?.[mid]?.contextWindow} onChange={(n) => onModelLimit(mid, "contextWindow", n)} placeholder="default" />
-                    </label>
-                    <label className="sd-mini-field">
-                      <span>max out</span>
-                      <TokenSizeInput value={row.modelConfig?.[mid]?.maxTokens} onChange={(n) => onModelLimit(mid, "maxTokens", n)} placeholder="default" />
-                    </label>
-                  </div>
-                )}
+              <div className="sd-hint">
+                no model ids — click “+ model” to add one, or “fetch models” to enumerate + auto-fill ctx/tokens from the endpoint.
               </div>
-            ))}
+            )}
+            {(row.models ?? []).map((mid, i) => {
+              const opt = row.modelOptions?.find((m) => m.id === mid);
+              const cfg = row.modelConfig?.[mid];
+              const ctxLive = opt?.contextWindowLive === true;
+              const maxLive = opt?.maxTokensLive === true;
+              const ctxVal = cfg?.contextWindow ?? opt?.contextWindow;
+              const maxVal = cfg?.maxTokens ?? opt?.maxTokens;
+              const reasoningVal = cfg?.reasoning ?? opt?.reasoning ?? false;
+              return (
+                <div className="sd-model-item" key={i}>
+                  <div className="sd-model-id-row">
+                    <input
+                      className="sd-input"
+                      list={`models-${row.id}`}
+                      value={mid}
+                      placeholder={preset?.exampleModelId || "model id"}
+                      onChange={(e) => {
+                        const next = [...(row.models ?? [])];
+                        const oldMid = next[i];
+                        const newMid = e.target.value;
+                        next[i] = newMid;
+                        // Re-key per-model limits so renaming a model keeps its
+                        // ctx/maxTokens/reasoning override (only when both ids
+                        // are non-empty; clearing the id leaves the override
+                        // under the old key, harmless and re-attached if restored).
+                        let mc = row.modelConfig;
+                        if (mc && oldMid && newMid && mc[oldMid]) {
+                          const { [oldMid]: v, ...rest } = mc;
+                          mc = { ...rest, [newMid]: v };
+                        }
+                        let opts = row.modelOptions;
+                        if (opts && oldMid && newMid) {
+                          opts = opts.map((m) => (m.id === oldMid ? { ...m, id: newMid } : m));
+                        }
+                        onChange({ models: next, ...(mc !== row.modelConfig ? { modelConfig: mc } : {}), ...(opts !== row.modelOptions ? { modelOptions: opts } : {}) });
+                      }}
+                    />
+                    <button
+                      className="sd-model-del"
+                      type="button"
+                      title="remove model"
+                      onClick={() => onChange({ models: (row.models ?? []).filter((_, j) => j !== i) })}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  {row.custom && mid && (
+                    <div className="sd-model-limits">
+                      <label className="sd-mini-field" title={ctxLive ? "auto-filled from /models (read-only)" : "context window tier"}>
+                        <span>ctx</span>
+                        {ctxLive && ctxVal ? (
+                          <span className="sd-readonly">{formatSize(ctxVal)} <em>auto</em></span>
+                        ) : (
+                          <TierSelect value={ctxVal} tiers={CTX_TIERS} onChange={(n) => onModelField(mid, "contextWindow", n)} />
+                        )}
+                      </label>
+                      <label className="sd-mini-field" title={maxLive ? "auto-filled from /models (read-only)" : "max output tier"}>
+                        <span>max out</span>
+                        {maxLive && maxVal ? (
+                          <span className="sd-readonly">{formatSize(maxVal)} <em>auto</em></span>
+                        ) : (
+                          <TierSelect value={maxVal} tiers={MAX_TIERS} onChange={(n) => onModelField(mid, "maxTokens", n)} />
+                        )}
+                      </label>
+                      <label className="sd-mini-field sd-reasoning" title="model supports reasoning/thinking">
+                        <input
+                          type="checkbox"
+                          checked={reasoningVal}
+                          onChange={(e) => onModelField(mid, "reasoning", e.target.checked)}
+                        />
+                        <span>reasoning</span>
+                      </label>
+                    </div>
+                  )}
+                  {!row.custom && mid && opt && (ctxVal || maxVal) && (
+                    // Preset providers: SDK catalog supplies ctx/maxTokens — read-only hint.
+                    <div className="sd-model-limits sd-preset-limits">
+                      {ctxVal ? <span className="sd-readonly">{formatSize(ctxVal)} ctx</span> : null}
+                      {maxVal ? <span className="sd-readonly">{formatSize(maxVal)} out</span> : null}
+                      {opt.reasoning ? <span className="sd-readonly">reasoning ✓</span> : null}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
             <datalist id={`models-${row.id}`}>
               {(row.modelOptions ?? []).map((m) => (
                 <option key={m.id} value={m.id}>{m.name}</option>
               ))}
             </datalist>
-            <button className="sd-fetch" onClick={onFetch} disabled={row.testing} title="fetch models + test key">
+            <button className="sd-fetch" onClick={onFetch} disabled={row.testing} title="fetch models + test key + auto-fill ctx/tokens">
               {row.testing ? "…" : "fetch models"}
             </button>
           </div>

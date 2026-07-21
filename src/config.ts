@@ -22,11 +22,21 @@ const USAGE_PATH = join(CONFIG_DIR, "usage.json");
  * When the provider is registered, each model's effective limits resolve as:
  *   modelConfig[id].contextWindow ?? provider.contextWindow ?? 128000
  *   modelConfig[id].maxTokens    ?? provider.maxTokens    ?? 8192
+ *   modelConfig[id].reasoning    ?? provider.reasoning    ?? false
+ * `source: "live"` marks a value auto-filled from GET {baseUrl}/models
+ * (context_length / max_completion_tokens / reasoning) — the UI shows it
+ * read-only. `source: "manual"` is a user-picked tier dropdown value. Absent
+ * modelConfig entry → global default (ctx 128000 / max 8192 / reasoning false).
  * This keeps contextWindow (input) and maxTokens (output cap) per-model so
  * switching models inside one provider picks up the right limits — a 1M-context
  * model and a 200K model under the same custom provider no longer share one cap
  * (the bug: shared provider-level limits applied to every model). */
-export type ModelLimits = { contextWindow?: number; maxTokens?: number };
+export type ModelLimits = {
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  source?: "live" | "manual";
+};
 
 /** A provider the user has configured. `custom` entries need registerProvider. */
 export type ProviderEntry = {
@@ -37,7 +47,8 @@ export type ProviderEntry = {
   models?: string[]; // model ids this provider offers (custom: registered as the provider's catalog)
   contextWindow?: number; // DEFAULT input context window for models w/o an explicit per-model override
   maxTokens?: number; // DEFAULT max output tokens for models w/o an explicit per-model override
-  modelConfig?: Record<string, ModelLimits>; // per-model ctx/maxTokens overrides (custom providers)
+  reasoning?: boolean; // DEFAULT reasoning capability for models w/o an explicit per-model override
+  modelConfig?: Record<string, ModelLimits>; // per-model ctx/maxTokens/reasoning (custom providers)
   custom?: boolean; // true → registerProvider(id, {baseUrl, api, models}) on apply
   enabled?: boolean; // default true; false = skip
 };
@@ -48,15 +59,20 @@ export type ProviderEntry = {
 export type ModelLimitSource = {
   contextWindow?: number;
   maxTokens?: number;
+  reasoning?: boolean;
   modelConfig?: Record<string, ModelLimits>;
 };
 
 /** Resolve a model's effective limits: per-model override → provider default → global. */
-export function resolveModelLimits(p: ModelLimitSource, modelId: string): { contextWindow: number; maxTokens: number } {
+export function resolveModelLimits(
+  p: ModelLimitSource,
+  modelId: string,
+): { contextWindow: number; maxTokens: number; reasoning: boolean } {
   const mc = p.modelConfig?.[modelId];
   return {
     contextWindow: mc?.contextWindow ?? p.contextWindow ?? 128000,
     maxTokens: mc?.maxTokens ?? p.maxTokens ?? 8192,
+    reasoning: mc?.reasoning ?? p.reasoning ?? false,
   };
 }
 
@@ -246,11 +262,11 @@ export async function applySettings(
           baseUrl: p.baseUrl,
           authHeader: true,
           api,
-          models: limits.map(({ id, contextWindow, maxTokens }) => ({
+          models: limits.map(({ id, contextWindow, maxTokens, reasoning }) => ({
             id,
             name: id,
             api,
-            reasoning: false,
+            reasoning,
             input: ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
             contextWindow,

@@ -104,6 +104,11 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 // (backward compat: routes without ?sessionId= fall back to the first live one).
 const sessions = new Map<string, AgentSessionRuntime>();
 const sessionMeta = new Map<string, { cwd: string; title?: string; created: number }>();
+// Stall detection (Task2): last epoch-ms an event was emitted for each session.
+// Updated in the SSE subscribe handler. If session.isStreaming but now -
+// lastEventAt exceeds a threshold, the upstream likely hung and the frontend
+// should show "possibly disconnected" instead of spinning forever.
+const sessionLastEvent = new Map<string, number>();
 const maxSessions = () => settingsState.maxSessions ?? 4;
 
 async function makeSession(opts: { cwd: string; sessionPath?: string }): Promise<AgentSessionRuntime> {
@@ -222,6 +227,10 @@ app.use("/api/*", cors({ origin: "*" }));
 // the live stdout. Capped per toolCallId; cleared on tool_execution_end.
 const partialResultBuffer = new Map<string, string[]>();
 const PARTIAL_CAP = 50;
+// Stall threshold (ms): a streaming turn silent this long is presumed hung —
+// the SSE keepalive tick pushes a `session_stall` frame past this so the
+// frontend can surface "possibly disconnected" instead of spinning forever.
+const STALL_MS = 60_000;
 function stringifyPartial(p: unknown): string {
   if (typeof p === "string") return p;
   if (p == null) return "";
@@ -246,13 +255,22 @@ function bufferPartial(event: { type?: string; toolCallId?: unknown; partialResu
 }
 
 app.get("/api/health", (c) => {
-  const s = rt(c).session;
+  const runtime = rt(c);
+  const s = runtime.session;
   const m = s.model;
+  const lastEventAt = sessionLastEvent.get(s.sessionId) ?? 0;
+  const streaming = s.isStreaming;
+  // ms since the last SSE event while streaming — the frontend polls this to
+  // cross-check its own stall watchdog (a hung upstream keeps isStreaming=true
+  // but stops emitting events). 0 when not streaming.
+  const stalledMs = streaming && lastEventAt ? Date.now() - lastEventAt : 0;
   return c.json({
     ok: true,
     sessionId: s.sessionId,
-    cwd: rt(c).cwd,
-    streaming: s.isStreaming,
+    cwd: runtime.cwd,
+    streaming,
+    lastEventAt,
+    stalledMs,
     hasModel: Boolean(m),
     model: m ? { id: m.id, provider: m.provider } : null,
     thinking: s.thinkingLevel,
@@ -320,6 +338,7 @@ app.get("/api/models", async (c) => {
       provider: m.provider,
       reasoning: m.reasoning,
       contextWindow: m.contextWindow,
+      maxTokens: m.maxTokens,
     })),
   );
 });
@@ -558,6 +577,7 @@ app.post("/api/session/dispose", async (c) => {
   const file = session.sessionFile;
   sessions.delete(sessionId);
   sessionMeta.delete(sessionId);
+  sessionLastEvent.delete(sessionId);
   if (!archive && file) {
     try {
       await unlink(file);
@@ -586,6 +606,7 @@ app.get("/api/settings", (c) => {
     models: p.models ?? [],
     contextWindow: p.contextWindow,
     maxTokens: p.maxTokens,
+    reasoning: p.reasoning,
     modelConfig: p.modelConfig ?? {},
     custom: p.custom,
     enabled: p.enabled !== false,
@@ -603,16 +624,27 @@ app.put("/api/settings", async (c) => {
     maxSessions?: number;
   }>();
   const providers: ProviderEntry[] = (body.providers ?? []).map((p) => {
-    // Per-model ctx/maxTokens overrides: drop blanks/zeroes so unset fields fall
-    // back to the provider default at registration time.
-    const mc: Record<string, { contextWindow?: number; maxTokens?: number }> = {};
+    // Per-model ctx/maxTokens/reasoning overrides: drop blanks/zeroes so unset
+    // fields fall back to the provider default at registration time. `source`
+    // ("live" from GET /models | "manual" tier-pick) is preserved so the UI can
+    // keep showing live values read-only across reloads.
+    const mc: Record<string, { contextWindow?: number; maxTokens?: number; reasoning?: boolean; source?: "live" | "manual" }> = {};
     if (p.modelConfig && typeof p.modelConfig === "object") {
       for (const [mid, ml] of Object.entries(p.modelConfig)) {
         if (!mid) continue;
-        const cfg = ml as { contextWindow?: number; maxTokens?: number };
+        const cfg = ml as { contextWindow?: number; maxTokens?: number; reasoning?: boolean; source?: "live" | "manual" };
         const ctx = typeof cfg.contextWindow === "number" && cfg.contextWindow > 0 ? cfg.contextWindow : undefined;
         const max = typeof cfg.maxTokens === "number" && cfg.maxTokens > 0 ? cfg.maxTokens : undefined;
-        if (ctx || max) mc[mid] = { ...(ctx ? { contextWindow: ctx } : {}), ...(max ? { maxTokens: max } : {}) };
+        const reasoning = typeof cfg.reasoning === "boolean" ? cfg.reasoning : undefined;
+        const source = cfg.source === "live" || cfg.source === "manual" ? cfg.source : undefined;
+        if (ctx || max || reasoning !== undefined) {
+          mc[mid] = {
+            ...(ctx ? { contextWindow: ctx } : {}),
+            ...(max ? { maxTokens: max } : {}),
+            ...(reasoning !== undefined ? { reasoning } : {}),
+            ...(source ? { source } : {}),
+          };
+        }
       }
     }
     return {
@@ -623,6 +655,7 @@ app.put("/api/settings", async (c) => {
       models: Array.isArray(p.models) ? p.models.map(String).filter(Boolean) : [],
       contextWindow: typeof p.contextWindow === "number" ? p.contextWindow : undefined,
       maxTokens: typeof p.maxTokens === "number" ? p.maxTokens : undefined,
+      reasoning: typeof p.reasoning === "boolean" ? p.reasoning : undefined,
       modelConfig: Object.keys(mc).length ? mc : undefined,
       custom: Boolean(p.custom),
       enabled: p.enabled !== false,
@@ -658,8 +691,41 @@ app.put("/api/settings", async (c) => {
 // Test a provider: set the key (runtime, non-persistent) and fetch available
 // models. For custom OpenAI-compatible providers, enumerate via GET
 // {baseUrl}/models (the standard OpenAI /models endpoint) so the UI shows real
-// model ids, not just the registered fallback. Falls back to the registered
-// model if the endpoint doesn't expose /models. Does NOT persist the key.
+// model ids, not just the registered fallback. ALSO parse each entry's
+// context_length / max_completion_tokens / reasoning when the endpoint returns
+// them (OpenRouter, Together, vLLM, …) so ctx/maxTokens/reasoning auto-fill —
+// the UI then shows them read-only instead of asking the user to type token
+// counts. Endpoints that don't surface these fields (plain OpenAI /models) →
+// the UI falls back to a tier dropdown. Does NOT persist the key.
+//
+// Field-name variance across OpenAI-compatible /models responses is real, so we
+// probe several known keys (top-level + nested under top_provider) per entry.
+function pickLimit(m: Record<string, unknown>, keys: string[]): number | undefined {
+  for (const k of keys) {
+    const v = (m as Record<string, unknown>)[k];
+    if (typeof v === "number" && v > 0) return v;
+    if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) {
+      const n = Number(v);
+      if (n > 0) return n;
+    }
+  }
+  return undefined;
+}
+function pickNested(m: Record<string, unknown>, container: string, keys: string[]): number | undefined {
+  const c = m[container];
+  if (c && typeof c === "object") return pickLimit(c as Record<string, unknown>, keys);
+  return undefined;
+}
+const CTX_KEYS = ["context_length", "context_window", "max_context_length", "max_context_tokens", "max_model_len"];
+const MAX_KEYS = ["max_completion_tokens", "max_output_tokens", "max_tokens", "max_generation_tokens", "output_token_limit"];
+function extractLiveLimits(m: Record<string, unknown>): { contextWindow?: number; maxTokens?: number; reasoning?: boolean } {
+  const contextWindow = pickLimit(m, CTX_KEYS) ?? pickNested(m, "top_provider", CTX_KEYS);
+  const maxTokens = pickLimit(m, MAX_KEYS) ?? pickNested(m, "top_provider", MAX_KEYS);
+  const reasoningRaw = m["reasoning"] ?? pickNested(m, "top_provider", ["reasoning"]);
+  const reasoning = reasoningRaw === true || reasoningRaw === "true";
+  return { contextWindow, maxTokens, reasoning };
+}
+
 app.post("/api/settings/test", async (c) => {
   const body = await c.req.json<{
     providerId?: string;
@@ -669,53 +735,25 @@ app.post("/api/settings/test", async (c) => {
     models?: string[];
     contextWindow?: number;
     maxTokens?: number;
-    modelConfig?: Record<string, { contextWindow?: number; maxTokens?: number }>;
+    modelConfig?: Record<string, { contextWindow?: number; maxTokens?: number; reasoning?: boolean; source?: "live" | "manual" }>;
     custom?: boolean;
   }>();
   const providerId = body.providerId?.trim();
   if (!providerId) return c.json({ ok: false, error: "providerId required" }, 400);
   try {
-    if (body.custom && body.baseUrl) {
-      const api = body.api || "openai-completions";
-      const modelIds = body.models && body.models.length ? body.models : [providerId];
-      // Per-model limits (same resolution as applySettings): each model gets
-      // its own ctx/maxTokens so a multi-model custom provider doesn't share
-      // one cap across models with different windows.
-      const providerLike = {
-        contextWindow: body.contextWindow,
-        maxTokens: body.maxTokens,
-        modelConfig: body.modelConfig,
-      };
-      const limits = modelIds.map((id) => ({
-        id,
-        ...resolveModelLimits(providerLike, id),
-      }));
-      modelRuntime.registerProvider(providerId, {
-        name: providerId,
-        baseUrl: body.baseUrl,
-        authHeader: true,
-        api,
-        models: limits.map(({ id, contextWindow, maxTokens }) => ({
-          id,
-          name: id,
-          api,
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow,
-          maxTokens,
-        })),
-      });
-    }
     if (body.apiKey) await modelRuntime.setRuntimeApiKey(providerId, body.apiKey);
     // effective key for the /models enumeration: prefer the just-provided key,
     // fall back to the persisted credential (so fetch works without re-entering
     // the key when hasKey is already true).
     const effKey = body.apiKey || credsState[providerId];
 
-    // For custom OpenAI-compatible providers, try to enumerate real models via
-    // GET {baseUrl}/models so the picker shows actual ids, not the fallback.
-    let liveModels: { id: string; name: string; provider: string; reasoning: boolean; contextWindow: number }[] | null = null;
+    // 1) For custom OpenAI-compatible providers, GET {baseUrl}/models to
+    //    enumerate real model ids AND auto-fill ctx/maxTokens/reasoning from the
+    //    response when the endpoint surfaces them (B2). Plain OpenAI /models
+    //    returns only ids → ctx/maxTokens stay undefined → UI tier dropdown.
+    type LiveLimits = { contextWindow?: number; maxTokens?: number; reasoning?: boolean };
+    type LiveModel = { id: string; name: string; provider: string; reasoning: boolean; contextWindow: number; maxTokens: number; source: "live"; _live: LiveLimits };
+    let liveModels: LiveModel[] | null = null;
     let liveErr: string | undefined;
     if (body.custom && body.baseUrl && (body.api === "openai-completions" || body.api === "openai-responses" || (!body.api))) {
       try {
@@ -725,19 +763,27 @@ app.post("/api/settings/test", async (c) => {
           signal: AbortSignal.timeout(8000),
         });
         if (r.ok) {
-          const j = (await r.json()) as { data?: { id?: string }[]; models?: { id?: string }[] };
-          const ids = (j.data ?? j.models ?? [])
-            .map((m) => m.id)
-            .filter((id): id is string => Boolean(id));
-          if (ids.length) {
-            liveModels = ids.map((id) => ({
-              id,
-              name: id,
-              provider: providerId,
-              reasoning: false,
-              contextWindow: body.contextWindow ?? 128000,
-            }));
-          }
+          const j = (await r.json()) as { data?: Record<string, unknown>[]; models?: Record<string, unknown>[] };
+          const entries = (j.data ?? j.models ?? []) as Record<string, unknown>[];
+          const parsed = entries
+            .map((m): LiveModel | null => {
+              const id = typeof m.id === "string" ? m.id : undefined;
+              if (!id) return null;
+              const lim = extractLiveLimits(m);
+              return {
+                id,
+                name: typeof m.name === "string" ? m.name : id,
+                provider: providerId,
+                reasoning: Boolean(lim.reasoning),
+                contextWindow: lim.contextWindow ?? (body.contextWindow ?? 128000),
+                maxTokens: lim.maxTokens ?? (body.maxTokens ?? 8192),
+                source: "live",
+                // carry the live-detected values so the UI can show them read-only
+                _live: lim,
+              };
+            })
+            .filter((x): x is LiveModel => x !== null);
+          if (parsed.length) liveModels = parsed;
         } else {
           liveErr = `endpoint returned ${r.status}`;
         }
@@ -746,8 +792,77 @@ app.post("/api/settings/test", async (c) => {
       }
     }
 
+    // 2) Register the custom provider (when custom) with per-model limits.
+    //    Prefer live-detected values (source:"live"); else the user's per-model
+    //    modelConfig override (source:"manual"); else body defaults; else global.
+    if (body.custom && body.baseUrl) {
+      const api = body.api || "openai-completions";
+      const liveById = new Map((liveModels ?? []).map((m) => [m.id, m]));
+      const modelIds =
+        liveModels && liveModels.length
+          ? liveModels.map((m) => m.id)
+          : body.models && body.models.length
+            ? body.models
+            : [providerId];
+      const providerLike = {
+        contextWindow: body.contextWindow,
+        maxTokens: body.maxTokens,
+        modelConfig: body.modelConfig,
+      };
+      const limits = modelIds.map((id) => {
+        const live = liveById.get(id)?._live;
+        const resolved = resolveModelLimits(providerLike, id);
+        // live-detected values win over stored config (they're fresh from the
+        // endpoint); reasoning likewise.
+        return {
+          id,
+          contextWindow: live?.contextWindow ?? resolved.contextWindow,
+          maxTokens: live?.maxTokens ?? resolved.maxTokens,
+          reasoning: live?.reasoning ?? resolved.reasoning,
+        };
+      });
+      modelRuntime.registerProvider(providerId, {
+        name: providerId,
+        baseUrl: body.baseUrl,
+        authHeader: true,
+        api,
+        models: limits.map(({ id, contextWindow, maxTokens, reasoning }) => ({
+          id,
+          name: id,
+          api,
+          reasoning,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow,
+          maxTokens,
+        })),
+      });
+    }
+
+    // 3) Return the model list for the picker + auto-fill. Each entry carries
+    //    the resolved ctx/maxTokens/reasoning + source ("live" if the endpoint
+    //    surfaced the value, else "registered"). The UI writes the live values
+    //    into modelConfig so they show read-only on next load.
     if (liveModels && liveModels.length) {
-      return c.json({ ok: true, models: liveModels, source: "live" });
+      const out = liveModels.map((m) => {
+        const lim = m._live ?? {};
+        const hasLive = Boolean(lim.contextWindow || lim.maxTokens || lim.reasoning);
+        return {
+          id: m.id,
+          name: m.name,
+          provider: providerId,
+          reasoning: m.reasoning,
+          contextWindow: m.contextWindow,
+          maxTokens: m.maxTokens,
+          // per-field "auto-filled" flags so the UI knows which fields came live
+          // (read-only) vs which are the fallback (tier dropdown).
+          contextWindowLive: lim.contextWindow != null,
+          maxTokensLive: lim.maxTokens != null,
+          reasoningLive: lim.reasoning === true,
+          source: hasLive ? "live" : ("registered" as const),
+        };
+      });
+      return c.json({ ok: true, models: out, source: "live", warning: liveErr });
     }
     // Fallback: return whatever the SDK has registered for this provider.
     const models = await modelRuntime.getAvailable(providerId);
@@ -759,9 +874,14 @@ app.post("/api/settings/test", async (c) => {
         provider: m.provider,
         reasoning: m.reasoning,
         contextWindow: m.contextWindow,
+        maxTokens: m.maxTokens,
+        contextWindowLive: false,
+        maxTokensLive: false,
+        reasoningLive: false,
+        source: "registered" as const,
+        warning: liveErr ? `could not fetch /models (${liveErr}); showing registered model` : undefined,
       })),
       source: "registered",
-      warning: liveErr ? `could not fetch /models (${liveErr}); showing registered model` : undefined,
     });
   } catch (e) {
     return c.json({ ok: false, error: String(e) }, 500);
@@ -842,6 +962,9 @@ app.get("/api/events", (c) => {
       unsub = s.subscribe((event) => {
         bufferPartial(event as { type?: string; toolCallId?: unknown; partialResult?: unknown });
         send(event);
+        // Stall detection: record the last event time so /api/health can report
+        // how long the session has been silent while streaming.
+        sessionLastEvent.set(s.sessionId, Date.now());
         // G02: a turn just finalized its cost — flush this session's snapshot
         // immediately so the dashboard's all-time total updates without the
         // 15s interval lag. Idempotent (snapshot-overwrite).
@@ -852,6 +975,14 @@ app.get("/api/events", (c) => {
       keepalive = setInterval(() => {
         try {
           controller.enqueue(encoder.encode(": keepalive\n\n"));
+          // Stall probe (Task2): if the session is streaming but hasn't emitted
+          // a real event in STALL_MS, push a `session_stall` data frame so the
+          // frontend surfaces "possibly disconnected" instead of spinning. The
+          // frontend dedups (fires onStall only on the false→true transition).
+          const last = sessionLastEvent.get(s.sessionId) ?? 0;
+          if (s.isStreaming && last && Date.now() - last > STALL_MS) {
+            send({ type: "session_stall", stalledMs: Date.now() - last });
+          }
         } catch {
           // closed
         }

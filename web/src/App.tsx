@@ -166,6 +166,11 @@ export function App() {
 
   const [streaming, setStreaming] = useState(false);
   const [connected, setConnected] = useState(false);
+  // Stall (Task2): true when a turn is streaming but no SSE event has arrived
+  // past the threshold → the upstream likely hung. `reconnectKey` forces the
+  // EventSource to reopen (banner's reconnect action) without switching session.
+  const [stalled, setStalled] = useState(false);
+  const [reconnectKey, setReconnectKey] = useState(0);
   const [input, setInput] = useState("");
   const [session, setSession] = useState<{ id: string; cwd: string } | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -450,6 +455,8 @@ export function App() {
     },
     setConnected,
     activeSessionId ?? undefined,
+    (s) => setStalled(s),
+    reconnectKey,
   );
 
   const refreshModels = useCallback(() => {
@@ -514,6 +521,13 @@ export function App() {
     } catch (e) {
       pushSystem(`abort: ${String(e)}`, "err");
     }
+  };
+  // Stall banner "reconnect": force-reopen the SSE stream for the active
+  // session. Used when the model looks hung — a fresh connection re-runs
+  // session_init (which re-applies the snapshot) and resumes the live stream.
+  const reconnectStream = () => {
+    setStalled(false);
+    setReconnectKey((k) => k + 1);
   };
   const doCompact = async () => {
     pushSystem("compacting…", "a");
@@ -841,6 +855,15 @@ export function App() {
               })}
               <div ref={chatEndRef} />
             </div>
+
+            {stalled && streaming && (
+              <div className="stall-banner" role="status">
+                <span className="stall-dot" />
+                <span className="stall-text">仍在思考，但已较久无响应 — 可能已断开</span>
+                <button className="stall-btn" onClick={reconnectStream} title="reopen the SSE stream">重连</button>
+                <button className="stall-btn danger" onClick={() => void doAbort()} title="abort the current run">中止</button>
+              </div>
+            )}
 
             <div className="composer">
               {slashOpen && (
