@@ -8,6 +8,7 @@ import {
   type TestModel,
 } from "../lib/api";
 import { PRESET_PROVIDERS, PRESET_BY_ID } from "../lib/presets";
+import { TokenSizeInput } from "./TokenSizeInput";
 
 // Right-side NON-MODAL drawer (G03-Q6): coexists with chat — no blocking
 // backdrop, chat stays interactive. Configures model providers (D01/G03):
@@ -30,22 +31,13 @@ const API_OPTIONS = [
 
 // Parse a context-window size with k / M shorthand: "1M" → 1_000_000,
 // "128k" → 128_000, "200000" → 200_000. Returns undefined if unparseable.
-function parseSize(s: string): number | undefined {
-  const m = s.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*([km]?)$/);
-  if (!m) return undefined;
-  const n = Number(m[1]);
-  if (!Number.isFinite(n)) return undefined;
-  const mult = m[2] === "k" ? 1000 : m[2] === "m" ? 1_000_000 : 1;
-  return Math.round(n * mult);
-}
-// Format a token count back to shorthand for display: 1_000_000 → "1M".
 function formatSize(n: number): string {
   if (n >= 1_000_000 && n % 1_000_000 === 0) return `${n / 1_000_000}M`;
   if (n >= 1000 && n % 1000 === 0) return `${n / 1000}k`;
   return String(n);
 }
 
-type Row = SettingsProvider & { modelOptions?: TestModel[]; testing?: boolean; testErr?: string; ctxText?: string; maxTokText?: string };
+type Row = SettingsProvider & { modelOptions?: TestModel[]; testing?: boolean; testErr?: string; expanded?: boolean };
 
 export function SettingsDrawer({
   onClose,
@@ -66,8 +58,8 @@ export function SettingsDrawer({
         s.providers.map((p) => ({
           ...p,
           apiKey: "",
-          ctxText: formatSize(p.contextWindow ?? 128000),
-          maxTokText: formatSize(p.maxTokens ?? 8192),
+          // #6: custom rows load collapsed (compact card); edit expands.
+          expanded: p.custom ? false : undefined,
         })),
       );
       setMaxSessions(s.maxSessions ?? 4);
@@ -101,7 +93,8 @@ export function SettingsDrawer({
     const id = `custom-${rows.length + 1}`;
     setRows((rs) => [
       ...rs,
-      { id, custom: true, enabled: true, apiKey: "", baseUrl: "", models: [], api: "openai-completions", contextWindow: 128000, ctxText: "128k", maxTokens: 8192, maxTokText: "8k" },
+      // #7: default max output tokens 128K (131072).
+      { id, custom: true, enabled: true, apiKey: "", baseUrl: "", models: [], api: "openai-completions", contextWindow: 128000, maxTokens: 131072, expanded: true },
     ]);
     setDirty(true);
   }
@@ -155,6 +148,8 @@ export function SettingsDrawer({
     setSaving(false);
     if (res.ok) {
       setDirty(false);
+      // #6: collapse custom rows after save so the drawer doesn't hog space.
+      setRows((rs) => rs.map((r) => (r.custom ? { ...r, expanded: false } : r)));
       const fail = res.failed?.length ?? 0;
       setStatus({
         kind: fail ? "err" : "ok",
@@ -215,6 +210,7 @@ export function SettingsDrawer({
               onChange={(p) => patch(r.id, p)}
               onRemove={() => removeRow(r.id)}
               onFetch={() => void fetchModels(r)}
+              onToggleExpand={() => patch(r.id, { expanded: !r.expanded })}
             />
           ))}
         </div>
@@ -254,169 +250,150 @@ function ProviderRow({
   onChange,
   onRemove,
   onFetch,
+  onToggleExpand,
 }: {
   row: Row;
   onChange: (p: Partial<Row>) => void;
   onRemove: () => void;
   onFetch: () => void;
+  onToggleExpand: () => void;
 }) {
   const preset = !row.custom ? PRESET_BY_ID.get(row.id) : undefined;
   const keyLabel = preset?.envVar ?? "API KEY";
+  // #6: custom rows collapse to a compact card; edit expands.
+  const collapsed = row.custom && !row.expanded;
   return (
-    <div className={`sd-row${row.custom ? " sd-row-custom" : ""}`}>
+    <div className={`sd-row${row.custom ? " sd-row-custom" : ""}${collapsed ? " sd-row-collapsed" : ""}`}>
       <div className="sd-row-head">
         <span className="sd-row-name">{preset?.name ?? row.name ?? row.id}</span>
         {row.custom && <span className="sd-tag">custom</span>}
         {!row.custom && <span className="sd-tag sd-tag-preset">preset</span>}
         {row.hasKey && !row.apiKey && <span className="sd-tag sd-tag-key" title="key saved">key ✓</span>}
+        {row.custom && (
+          <button className="sd-row-edit" onClick={onToggleExpand} title={collapsed ? "edit" : "collapse"}>
+            {collapsed ? "✎ edit" : "▴ collapse"}
+          </button>
+        )}
         <button className="sd-row-del" onClick={onRemove} title="remove">✕</button>
       </div>
 
-      {row.custom && (
-        <label className="sd-field">
-          <span>provider id</span>
-          <input
-            className="sd-input"
-            value={row.id}
-            placeholder="my-provider"
-            onChange={(e) => onChange({ id: e.target.value })}
-          />
-        </label>
-      )}
-      {row.custom && (
-        <label className="sd-field">
-          <span>base url</span>
-          <input
-            className="sd-input"
-            value={row.baseUrl ?? ""}
-            placeholder="https://…"
-            onChange={(e) => onChange({ baseUrl: e.target.value })}
-          />
-        </label>
-      )}
-      {row.custom && (
-        <label className="sd-field">
-          <span>api (wire format)</span>
-          <select
-            className="sd-input"
-            value={row.api ?? "openai-completions"}
-            onChange={(e) => onChange({ api: e.target.value })}
-          >
-            {API_OPTIONS.map((o) => (
-              <option key={o.id} value={o.id}>
-                {o.name}
-              </option>
-            ))}
-          </select>
-        </label>
-      )}
-      {row.custom && (
-        <label className="sd-field">
-          <span>context window (tokens, input)</span>
-          <input
-            className="sd-input sd-num"
-            type="text"
-            value={row.ctxText ?? ""}
-            placeholder="e.g. 128k or 1M"
-            onChange={(e) => {
-              const raw = e.target.value;
-              const parsed = parseSize(raw);
-              onChange({
-                ctxText: raw,
-                contextWindow: parsed ?? row.contextWindow ?? 128000,
-              });
-            }}
-            onBlur={(e) => {
-              // normalize display on blur if it parses
-              const parsed = parseSize(e.target.value);
-              if (parsed !== undefined) onChange({ ctxText: formatSize(parsed), contextWindow: parsed });
-            }}
-          />
-        </label>
-      )}
-      {row.custom && (
-        <label className="sd-field">
-          <span>max output tokens (max_completion_tokens)</span>
-          <input
-            className="sd-input sd-num"
-            type="text"
-            value={row.maxTokText ?? ""}
-            placeholder="e.g. 8k"
-            onChange={(e) => {
-              const raw = e.target.value;
-              const parsed = parseSize(raw);
-              onChange({
-                maxTokText: raw,
-                maxTokens: parsed ?? row.maxTokens ?? 8192,
-              });
-            }}
-            onBlur={(e) => {
-              const parsed = parseSize(e.target.value);
-              if (parsed !== undefined) onChange({ maxTokText: formatSize(parsed), maxTokens: parsed });
-            }}
-          />
-        </label>
-      )}
-
-      <label className="sd-field">
-        <span>{keyLabel.toLowerCase()}</span>
-        <input
-          className="sd-input"
-          type="password"
-          value={row.apiKey ?? ""}
-          placeholder={row.hasKey ? "•••• (enter to replace)" : "paste api key"}
-          onChange={(e) => onChange({ apiKey: e.target.value })}
-        />
-      </label>
-
-      <div className="sd-models">
-        <div className="sd-models-head">
-          <span>models</span>
-          <button
-            className="sd-add-model"
-            type="button"
-            onClick={() => onChange({ models: [...(row.models ?? []), ""] })}
-            title="add another model id"
-          >
-            + model
-          </button>
+      {collapsed && (
+        <div className="sd-row-summary">
+          {row.baseUrl && <span className="sd-summary-bit" title={row.baseUrl}>{row.baseUrl.replace(/^https?:\/\//, "")}</span>}
+          <span className="sd-summary-bit">{(row.models ?? []).length || 0} model(s)</span>
+          <span className="sd-summary-bit">{formatSize(row.contextWindow ?? 128000)} ctx</span>
+          <span className="sd-summary-bit">{formatSize(row.maxTokens ?? 131072)} out</span>
         </div>
-        {(row.models ?? []).length === 0 && (
-          <div className="sd-hint">no model ids — click “+ model” to add one (or “fetch models” to enumerate).</div>
-        )}
-        {(row.models ?? []).map((mid, i) => (
-          <div className="sd-model-item" key={i}>
+      )}
+
+      {row.custom && !collapsed && (
+        <>
+          <label className="sd-field">
+            <span>provider id</span>
             <input
               className="sd-input"
-              list={`models-${row.id}`}
-              value={mid}
-              placeholder={preset?.exampleModelId || "model id"}
-              onChange={(e) => {
-                const next = [...(row.models ?? [])];
-                next[i] = e.target.value;
-                onChange({ models: next });
-              }}
+              value={row.id}
+              placeholder="my-provider"
+              onChange={(e) => onChange({ id: e.target.value })}
             />
-            <button
-              className="sd-model-del"
-              type="button"
-              title="remove model"
-              onClick={() => onChange({ models: (row.models ?? []).filter((_, j) => j !== i) })}
+          </label>
+          <label className="sd-field">
+            <span>base url</span>
+            <input
+              className="sd-input"
+              value={row.baseUrl ?? ""}
+              placeholder="https://…"
+              onChange={(e) => onChange({ baseUrl: e.target.value })}
+            />
+          </label>
+          <label className="sd-field">
+            <span>api (wire format)</span>
+            <select
+              className="sd-input"
+              value={row.api ?? "openai-completions"}
+              onChange={(e) => onChange({ api: e.target.value })}
             >
-              ✕
+              {API_OPTIONS.map((o) => (
+                <option key={o.id} value={o.id}>
+                  {o.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="sd-field">
+            <span>context window (input tokens)</span>
+            <TokenSizeInput value={row.contextWindow} onChange={(n) => onChange({ contextWindow: n })} placeholder="e.g. 128k" />
+          </label>
+          <label className="sd-field">
+            <span>max output tokens</span>
+            <TokenSizeInput value={row.maxTokens} onChange={(n) => onChange({ maxTokens: n })} placeholder="e.g. 128k" />
+          </label>
+        </>
+      )}
+
+      {(!row.custom || !collapsed) && (
+        <>
+          <label className="sd-field">
+            <span>{keyLabel.toLowerCase()}</span>
+            <input
+              className="sd-input"
+              type="password"
+              value={row.apiKey ?? ""}
+              placeholder={row.hasKey ? "•••• (enter to replace)" : "paste api key"}
+              onChange={(e) => onChange({ apiKey: e.target.value })}
+            />
+          </label>
+
+          <div className="sd-models">
+            <div className="sd-models-head">
+              <span>models</span>
+              <button
+                className="sd-add-model"
+                type="button"
+                onClick={() => onChange({ models: [...(row.models ?? []), ""] })}
+                title="add another model id"
+              >
+                + model
+              </button>
+            </div>
+            {(row.models ?? []).length === 0 && (
+              <div className="sd-hint">no model ids — click “+ model” to add one (or “fetch models” to enumerate).</div>
+            )}
+            {(row.models ?? []).map((mid, i) => (
+              <div className="sd-model-item" key={i}>
+                <input
+                  className="sd-input"
+                  list={`models-${row.id}`}
+                  value={mid}
+                  placeholder={preset?.exampleModelId || "model id"}
+                  onChange={(e) => {
+                    const next = [...(row.models ?? [])];
+                    next[i] = e.target.value;
+                    onChange({ models: next });
+                  }}
+                />
+                <button
+                  className="sd-model-del"
+                  type="button"
+                  title="remove model"
+                  onClick={() => onChange({ models: (row.models ?? []).filter((_, j) => j !== i) })}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            <datalist id={`models-${row.id}`}>
+              {(row.modelOptions ?? []).map((m) => (
+                <option key={m.id} value={m.id}>{m.name}</option>
+              ))}
+            </datalist>
+            <button className="sd-fetch" onClick={onFetch} disabled={row.testing} title="fetch models + test key">
+              {row.testing ? "…" : "fetch models"}
             </button>
           </div>
-        ))}
-        <datalist id={`models-${row.id}`}>
-          {(row.modelOptions ?? []).map((m) => (
-            <option key={m.id} value={m.id}>{m.name}</option>
-          ))}
-        </datalist>
-        <button className="sd-fetch" onClick={onFetch} disabled={row.testing} title="fetch models + test key">
-          {row.testing ? "…" : "fetch models"}
-        </button>
-      </div>
-      {row.testErr && <div className="sd-err">{row.testErr}</div>}
+          {row.testErr && <div className="sd-err">{row.testErr}</div>}
+        </>
+      )}
     </div>
   );
 }

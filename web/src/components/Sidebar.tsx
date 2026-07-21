@@ -2,7 +2,8 @@ import { useState } from "react";
 import type { LiveSession } from "../lib/api";
 
 // G01 left sidebar: live session list with title (auto from first prompt) +
-// cwd tag, new / switch / rename. The dashboard's old Sessions panel moves here.
+// cwd tag, new / switch / rename / archive / delete. The dashboard's old
+// Sessions panel moved here (#1 collapses to a thin dots-only rail).
 //
 // Concurrency: a streaming session shows a pulse dot. The active one is
 // highlighted. Click to switch (the parent re-points all api calls at it).
@@ -14,6 +15,10 @@ export function Sidebar({
   onSelect,
   onNew,
   onRename,
+  onArchive,
+  onDelete,
+  collapsed,
+  onToggleCollapse,
 }: {
   sessions: LiveSession[];
   activeId: string | null;
@@ -21,19 +26,48 @@ export function Sidebar({
   onSelect: (id: string) => void;
   onNew: () => void;
   onRename: (id: string, title: string) => void;
+  onArchive: (id: string) => void;
+  onDelete: (id: string) => void;
+  collapsed: boolean;
+  onToggleCollapse: () => void;
 }) {
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
 
   const atCap = sessions.length >= max;
 
+  if (collapsed) {
+    // #1: thin rail — dots only (active highlighted), hover for title; expand
+    // button at the top. Keeps the browser surface for the chat + dashboard.
+    return (
+      <aside className="sidebar collapsed">
+        <button className="sb-collapse" onClick={onToggleCollapse} title="expand sessions">▸</button>
+        <div className="sb-list">
+          {sessions.map((s) => (
+            <button
+              key={s.sessionId}
+              className={`sb-rail${s.sessionId === activeId ? " active" : ""}`}
+              onClick={() => onSelect(s.sessionId)}
+              title={`${s.title ?? "untitled"} · ${s.cwd}${s.streaming ? " · streaming" : ""}`}
+            >
+              <span className={`sb-dot${s.streaming ? " on" : ""}`} />
+            </button>
+          ))}
+        </div>
+      </aside>
+    );
+  }
+
   return (
     <aside className="sidebar">
       <div className="sb-head">
         <span>Sessions</span>
-        <button className="sb-new" onClick={onNew} disabled={atCap} title={atCap ? `max ${max} reached` : "new session"}>
-          + new
-        </button>
+        <div className="sb-head-right">
+          <button className="sb-new" onClick={onNew} disabled={atCap} title={atCap ? `max ${max} reached` : "new session"}>
+            + new
+          </button>
+          <button className="sb-collapse" onClick={onToggleCollapse} title="collapse">▾</button>
+        </div>
       </div>
       <div className="sb-list">
         {sessions.length === 0 && <div className="sb-empty">no sessions</div>}
@@ -68,17 +102,39 @@ export function Sidebar({
                   <span className={`sb-dot${s.streaming ? " on" : ""}`} title={s.streaming ? "streaming" : "idle"} />
                   <span className="sb-title">{s.title ?? "untitled"}</span>
                   <span className="sb-cwd" title={s.cwd}>{cwdTag}</span>
-                  <button
-                    className="sb-edit"
-                    title="rename"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setDraft(s.title ?? "");
-                      setEditing(s.sessionId);
-                    }}
-                  >
-                    ✎
-                  </button>
+                  <span className="sb-actions">
+                    <button
+                      className="sb-act"
+                      title="rename"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setDraft(s.title ?? "");
+                        setEditing(s.sessionId);
+                      }}
+                    >
+                      ✎
+                    </button>
+                    <button
+                      className="sb-act sb-archive"
+                      title="archive (keep file, free slot)"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onArchive(s.sessionId);
+                      }}
+                    >
+                      📦
+                    </button>
+                    <button
+                      className="sb-act sb-delete"
+                      title="delete session + file"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDelete(s.sessionId);
+                      }}
+                    >
+                      🗑
+                    </button>
+                  </span>
                 </>
               )}
             </div>

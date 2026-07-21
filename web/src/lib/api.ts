@@ -258,6 +258,20 @@ export async function renameSession(
   return (await res.json()) as { ok: boolean; title?: string; error?: string };
 }
 
+// #3: dispose a live session — archive (keep file, resumable) or delete (unlink).
+// Returns newActiveId to switch to (the app always keeps ≥1 live session).
+export async function disposeSession(
+  sessionId: string,
+  archive: boolean,
+): Promise<{ ok: boolean; newActiveId?: string; archived?: boolean; error?: string }> {
+  const res = await fetch(`${API_BASE}/api/session/dispose`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, archive }),
+  });
+  return (await res.json()) as { ok: boolean; newActiveId?: string; archived?: boolean; error?: string };
+}
+
 // ---- Settings (D01/G03: self-contained model provider config) ----
 
 export type SettingsProvider = {

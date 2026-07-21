@@ -18,6 +18,8 @@
 //   GET  /api/sessions?cwd=    saved sessions in a cwd (for resume picker)
 //   GET  /api/dirs?path=       subdirectories (for cwd browser)
 //   POST /api/session          switch cwd (fresh) or resume {cwd, sessionPath?}
+//   POST /api/session/rename   {sessionId, title}
+//   POST /api/session/dispose  archive/delete a live session {sessionId, archive}
 //   GET  /api/events           SSE stream of AgentSessionEvent
 
 import { serve } from "@hono/node-server";
@@ -516,6 +518,42 @@ app.post("/api/session/rename", async (c) => {
   return c.json({ ok: true, title: meta.title });
 });
 
+// #3: dispose a live session — archive (keep the session file, free the slot,
+// resumable later via the cwd picker) or delete (also unlink the file). Aborts
+// any in-flight run first. If this was the last live session, creates a fresh
+// default so the app stays usable. Returns the id the frontend should switch to.
+app.post("/api/session/dispose", async (c) => {
+  const { sessionId, archive } = await c.req.json<{ sessionId?: string; archive?: boolean }>();
+  if (!sessionId) return c.json({ ok: false, error: "sessionId required" }, 400);
+  const runtime = sessions.get(sessionId);
+  if (!runtime) return c.json({ ok: false, error: "session not live" }, 404);
+  const { cwd: goneCwd, session } = runtime;
+  try {
+    await session.abort();
+  } catch {
+    // not streaming — fine
+  }
+  const file = session.sessionFile;
+  sessions.delete(sessionId);
+  sessionMeta.delete(sessionId);
+  if (!archive && file) {
+    try {
+      await unlink(file);
+    } catch {
+      // file may already be gone — fine
+    }
+  }
+  let newActiveId: string | undefined;
+  if (sessions.size === 0) {
+    // keep the app usable: spin up a fresh default in the disposed session's cwd
+    const fresh = await makeSession({ cwd: goneCwd });
+    newActiveId = fresh.session.sessionId;
+  } else {
+    newActiveId = [...sessions.values()][0]?.session.sessionId;
+  }
+  return c.json({ ok: true, newActiveId, archived: Boolean(archive) });
+});
+
 app.get("/api/settings", (c) => {
   // Never leak api keys; surface hasKey instead.
   const providers = settingsState.providers.map((p) => ({
@@ -602,7 +640,7 @@ app.post("/api/settings/test", async (c) => {
       const api = body.api || "openai-completions";
       const modelIds = body.models && body.models.length ? body.models : [providerId];
       const ctx = body.contextWindow ?? 128000;
-      const maxTok = body.maxTokens ?? 8192; // max OUTPUT (max_completion_tokens), decoupled from input window
+      const maxTok = body.maxTokens ?? 131072; // max OUTPUT (max_completion_tokens), default 128K (#7)
       modelRuntime.registerProvider(providerId, {
         name: providerId,
         baseUrl: body.baseUrl,

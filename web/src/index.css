@@ -711,11 +711,15 @@ header.app {
 }
 .layout {
   display: grid;
-  grid-template-columns: 220px minmax(0, 1fr) 340px;
+  grid-template-columns: 220px minmax(0, 1fr) 280px;
   gap: 20px;
   width: 100%;
   height: 100%;
   min-height: 0;
+}
+/* #1: sidebar collapsed to a thin dots-only rail */
+.layout.sidebar-collapsed {
+  grid-template-columns: 44px minmax(0, 1fr) 280px;
 }
 
 /* G01 left sidebar — live session list */
@@ -819,6 +823,65 @@ header.app {
   font-size: 11px;
   color: var(--dim);
 }
+
+/* #1: collapsed rail */
+.sidebar.collapsed { padding: 6px 0; }
+.sidebar.collapsed .sb-collapse {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 6px 0;
+}
+.sidebar.collapsed .sb-collapse:hover { color: var(--ink); }
+.sidebar.collapsed .sb-list { padding: 4px 0; display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.sb-rail {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  border-radius: 7px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sb-rail:hover { background: var(--bg); }
+.sb-rail.active { background: rgba(184, 134, 11, 0.12); }
+
+/* expanded-view collapse toggle (header) + per-row action group */
+.sb-head-right { display: flex; align-items: center; gap: 4px; }
+.sb-collapse {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--dim);
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 11px;
+  width: 22px;
+  height: 20px;
+  padding: 0;
+}
+.sb-collapse:hover { color: var(--ink); border-color: var(--amber); }
+.sb-actions {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+}
+.sb-item:hover .sb-actions { opacity: 1; }
+.sb-act {
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px;
+  line-height: 1;
+}
+.sb-act:hover { color: var(--ink); }
+.sb-act.sb-delete:hover { color: var(--red); }
 
 /* bottom controls row (model / thinking / cwd / compact) */
 .controls-row {
@@ -1404,6 +1467,59 @@ header.app {
   cursor: pointer;
 }
 .sd-row-del:hover { color: var(--red); }
+.sd-row-edit {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--dim);
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 10px;
+  padding: 1px 7px;
+  margin-left: 6px;
+}
+.sd-row-edit:hover { color: var(--ink); border-color: var(--amber); }
+/* #6: collapsed custom row — compact card with a summary line */
+.sd-row-collapsed { padding-bottom: 10px; }
+.sd-row-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+.sd-summary-bit {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--dim);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 6px;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* #7: token-size input — number box + K/M unit toggles */
+.ts-input { display: flex; align-items: stretch; gap: 6px; }
+.ts-input .sd-num { flex: 1; }
+.ts-units { display: flex; gap: 3px; }
+.ts-unit {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--dim);
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  width: 30px;
+  padding: 0;
+}
+.ts-unit:hover { color: var(--ink); }
+.ts-unit.on {
+  background: rgba(184, 134, 11, 0.15);
+  color: var(--amber);
+  border-color: var(--amber);
+}
 .sd-field {
   display: flex;
   flex-direction: column;

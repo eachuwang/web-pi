@@ -5,6 +5,7 @@ import {
   abortRun,
   compactNow,
   deleteSession,
+  disposeSession,
   getCommands,
   getGitBranch,
   getMessages,
@@ -184,6 +185,7 @@ export function App() {
   const [skillPicker, setSkillPicker] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [slashCmds, setSlashCmds] = useState<SlashCommand[]>([]);
   const [slashIndex, setSlashIndex] = useState(0);
 
@@ -585,6 +587,36 @@ export function App() {
     if (r.ok) void fetchLiveSessions();
   };
 
+  // #3: dispose a live session. archive keeps the file (resumable later via the
+  // cwd picker); delete unlinks it. Backend always keeps ≥1 live session and
+  // returns the id to switch to. If the disposed one was active, reconnect SSE.
+  const disposeLive = async (id: string, archive: boolean) => {
+    const r = await disposeSession(id, archive);
+    if (!r.ok) {
+      pushSystem(`${archive ? "archive" : "delete"}: ${r.error ?? "failed"}`, "err");
+      return;
+    }
+    pushSystem(archive ? "session archived" : "session deleted", archive ? "a" : "ok");
+    if (r.newActiveId && r.newActiveId !== activeSessionId) {
+      listRef.current = [];
+      setStats(null);
+      setQueue({ steer: [], follow: [] });
+      setActiveSessionId(r.newActiveId);
+    }
+    void fetchLiveSessions();
+  };
+  const onArchiveSession = (id: string) => void disposeLive(id, true);
+  const onDeleteLive = (id: string) => {
+    setConfirmDialog({
+      title: "delete session",
+      body: "Delete this session and its saved file? This cannot be undone.",
+      confirm: async () => {
+        setConfirmDialog(null);
+        await disposeLive(id, false);
+      },
+    });
+  };
+
   const onDeleteSession = (path: string) => {
     setConfirmDialog({
       title: "delete session",
@@ -656,7 +688,7 @@ export function App() {
       </header>
 
       <div className="wrap">
-        <div className="layout">
+        <div className={`layout${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
           <Sidebar
             sessions={liveSessions}
             activeId={activeSessionId}
@@ -664,6 +696,10 @@ export function App() {
             onSelect={(id) => selectSession(id)}
             onNew={() => void newSession()}
             onRename={(id, title) => void doRename(id, title)}
+            onArchive={onArchiveSession}
+            onDelete={onDeleteLive}
+            collapsed={sidebarCollapsed}
+            onToggleCollapse={() => setSidebarCollapsed((v) => !v)}
           />
           <section className="chat">
             <div
@@ -835,7 +871,7 @@ export function App() {
                   </option>
                 ))}
               </select>
-              <span className="ctrl-label">think mode</span>
+              <span className="ctrl-label">THINK</span>
               <select
                 className="sel"
                 value={thinking}
@@ -857,7 +893,7 @@ export function App() {
               >
                 <span className="branch-name">skill</span> <span className="arr" />
               </button>
-              <span className="ctrl-label">current Dir</span>
+              <span className="ctrl-label">DIR</span>
               <button className="cwd-btn" onClick={() => setPicker(true)} title="switch cwd / resume session">
                 <span className="cwd">{session?.cwd ?? "…"}</span> <span className="arr" />
               </button>
