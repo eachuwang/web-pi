@@ -27,9 +27,11 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { execFile } from "node:child_process";
-import { readdirSync, readFileSync, existsSync } from "node:fs";
-import { unlink } from "node:fs/promises";
-import { promisify } from "node:util";
+import fs from "node:fs";
+import { readdirSync, readFileSync, existsSync, createReadStream, statSync } from "node:fs";
+import { unlink, mkdir, writeFile, rm } from "node:fs/promises";
+import { promisify } from "util";
+import path from "node:path";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -38,10 +40,24 @@ import {
   createAgentSessionServices,
   getAgentDir,
   ModelRuntime,
+  parseFrontmatter,
   SessionManager,
   type AgentSessionRuntime,
   type CreateAgentSessionRuntimeFactory,
 } from "@earendil-works/pi-coding-agent";
+import {
+  IGNORED_NAMES,
+  IGNORED_SUFFIXES,
+  IMAGE_PREVIEW_MAX_BYTES,
+  TEXT_PREVIEW_MAX_BYTES,
+  allowedRoots as allowedRootsFn,
+  getAudioMime,
+  getImageMime,
+  getLanguage,
+  isPathAllowed,
+  isPdfPath,
+  resolveDirentIsDirectory,
+} from "./file-serving";
 import {
   applySettings,
   loadCredentials,
@@ -51,6 +67,7 @@ import {
   resolveModelLimits,
   saveCredentials,
   saveSettings,
+  CONFIG_DIR,
   type ProviderEntry,
   type Settings,
   type UsageData,
@@ -75,6 +92,11 @@ if (applyResult.applied.length) {
 
 // Runtime factory: closes over process-global inputs (modelRuntime) and
 // recreates cwd-bound services for the effective cwd. Reused on cwd switches.
+// F06: additionalSkillPaths injects ~/.web-pi/skills so skills installed by
+// the F06 panel (pure-HTTP from skills.sh/GitHub, no `npx skills`) are
+// discovered by the agent's loader — self-contained (G04), no ~/.pi dependency
+// for installed skills.
+const WEB_PI_SKILLS_DIR = join(CONFIG_DIR, "skills");
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({
   cwd: sessionCwd,
   agentDir,
@@ -85,6 +107,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({
     cwd: sessionCwd,
     agentDir,
     modelRuntime,
+    resourceLoaderOptions: { additionalSkillPaths: [WEB_PI_SKILLS_DIR] },
   });
   return {
     ...(await createAgentSessionFromServices({
@@ -376,9 +399,20 @@ app.post("/api/prompt", async (c) => {
   const body = await c.req.json<{
     message?: string;
     streamingBehavior?: "steer" | "followUp";
+    // F01: image attachments. ImageContent = { type: "image", data: <base64
+    // no prefix>, mimeType }. Frontend reads dropped/pasted files into base64
+    // and passes them through; SDK prompt()/steer()/followUp() all accept images.
+    images?: { type: "image"; data: string; mimeType: string }[];
   }>();
   const message = body.message?.trim();
   if (!message) return c.json({ accepted: false, error: "message required" }, 400);
+  // F01: cap image payload size defensively (per-image 5MB base64 ≈ 6.7MB) so a
+  // runaway paste doesn't OOM the in-process session. Reject the whole request.
+  const MAX_IMAGES = 4;
+  const MAX_IMG_BYTES = 5 * 1024 * 1024;
+  const images = body.images?.slice(0, MAX_IMAGES).filter((im) => {
+    return im && im.type === "image" && typeof im.data === "string" && typeof im.mimeType === "string" && im.data.length <= MAX_IMG_BYTES * 1.4;
+  });
   // G01: auto-title this session from the first user prompt (if unnamed).
   const runtime = rt(c);
   const meta = sessionMeta.get(runtime.session.sessionId);
@@ -387,11 +421,71 @@ app.post("/api/prompt", async (c) => {
     runtime.session
       .prompt(message, {
         streamingBehavior: body.streamingBehavior,
+        images,
         preflightResult: (ok) => resolve({ accepted: ok, error: ok ? undefined : "session is busy (still streaming)" }),
       })
       .catch((e: unknown) => resolve({ accepted: false, error: String(e) }));
   });
   return c.json(result, result.accepted ? 200 : 409);
+});
+
+// F03: session fork — list forkable user messages + fork from one.
+// SDK: session.getUserMessagesForForking() → [{entryId, text}]; runtime.fork(entryId,
+// {position:"at"}) creates a branched session file and swaps the runtime's
+// internal session to it (same runtime object, new sessionId). We re-key the
+// sessions/sessionMeta maps so ?sessionId=newId resolves to the same runtime.
+app.get("/api/fork-points", (c) => {
+  const s = rt(c).session;
+  const points = s.getUserMessagesForForking().map((p) => ({ entryId: p.entryId, text: p.text }));
+  return c.json({ points });
+});
+
+app.post("/api/fork", async (c) => {
+  const { entryId } = await c.req.json<{ entryId?: string }>();
+  if (!entryId) return c.json({ ok: false, error: "entryId required" }, 400);
+  const runtime = rt(c);
+  // Refuse while streaming — forking mid-turn would branch an incomplete state.
+  if (runtime.session.isStreaming) return c.json({ ok: false, error: "session is busy (still streaming)" }, 409);
+  const oldId = runtime.session.sessionId;
+  const oldFile = runtime.session.sessionFile;
+  const oldMeta = sessionMeta.get(oldId);
+  const oldCwd = oldMeta?.cwd ?? rt().cwd;
+  try {
+    const result = await runtime.fork(entryId, { position: "at" });
+    if (result.cancelled) return c.json({ ok: false, error: "fork cancelled" }, 400);
+    const newId = runtime.session.sessionId;
+    // runtime.fork swaps THIS runtime to the new branch (same object, new id).
+    // Re-key the map so ?sessionId=newId resolves to it.
+    if (newId !== oldId) {
+      sessions.delete(oldId);
+      sessions.set(newId, runtime);
+      sessionMeta.delete(oldId);
+      sessionMeta.set(newId, {
+        cwd: oldCwd,
+        created: Date.now(),
+        ...(oldMeta?.title ? { title: `${oldMeta.title} (fork)` } : {}),
+      });
+    }
+    // F03: preserve the ORIGINAL as a separate live runtime (G01 multi-session
+    // — fork shouldn't evict the session you forked from). Re-open the original
+    // session file; makeSession registers it in the map + meta. Best-effort:
+    // if we're at the session cap or re-open fails, the original is still
+    // saved on disk (resumable via the cwd picker) — the fork itself succeeded.
+    if (oldFile) {
+      try {
+        const orig = await makeSession({ cwd: oldCwd, sessionPath: oldFile });
+        if (oldMeta?.title) {
+          const m = sessionMeta.get(orig.session.sessionId);
+          if (m) m.title = oldMeta.title;
+        }
+      } catch {
+        // best-effort — original remains on disk
+      }
+    }
+    return c.json({ ok: true, sessionId: newId });
+  } catch (e) {
+    return c.json({ ok: false, error: String(e) }, 500);
+  }
 });
 
 app.post("/api/abort", async (c) => {
@@ -463,12 +557,48 @@ async function runGit(
 }
 
 app.get("/api/git/branch", async (c) => {
-  const cwd = c.req.query("cwd") ?? rt().cwd;
+  // Session-scoped: ?sessionId= picks the runtime (and thus its cwd) so the
+  // branch reflects the ACTIVE session's cwd, not the first live session.
+  const cwd = c.req.query("cwd") ?? rt(c).cwd;
   const cur = await runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
   if (!cur.ok) return c.json({ repo: false, current: "", branches: [] });
   const lst = await runGit(cwd, ["for-each-ref", "--format=%(refname:short)", "refs/heads/"]);
   const branches = lst.ok ? lst.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
   return c.json({ repo: true, current: cur.stdout.trim(), branches });
+});
+
+// F04: list git worktrees so the user can switch the session cwd to a different
+// worktree (each is an independent working tree on a branch). `git worktree list
+// --porcelain` emits blocks separated by blank lines: first line "worktree
+// <path>", then "HEAD <sha>", then "branch <ref>" or "detached". The first
+// block is the main worktree. Switching = switchSession(worktreePath) on the
+// client (creates a new live session in that cwd); no new switch route needed.
+app.get("/api/git/worktrees", async (c) => {
+  const cwd = c.req.query("cwd") ?? rt(c).cwd;
+  const repo = await runGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
+  if (!repo.ok) return c.json({ repo: false, worktrees: [] });
+  const lst = await runGit(cwd, ["worktree", "list", "--porcelain"]);
+  if (!lst.ok) return c.json({ repo: true, worktrees: [] });
+  const blocks = lst.stdout.split(/\n\s*\n/).filter(Boolean);
+  const worktrees = blocks.map((blk, i) => {
+    const lines = blk.split("\n");
+    const pathLine = lines.find((l) => l.startsWith("worktree "));
+    const headLine = lines.find((l) => l.startsWith("HEAD "));
+    const branchLine = lines.find((l) => l.startsWith("branch "));
+    const detached = lines.includes("detached");
+    const path = pathLine ? pathLine.slice("worktree ".length).trim() : "";
+    return {
+      path,
+      head: headLine ? headLine.slice("HEAD ".length).trim().slice(0, 12) : "",
+      branch: detached
+        ? "(detached)"
+        : branchLine
+          ? branchLine.slice("branch refs/heads/".length).trim()
+          : "",
+      isMain: i === 0,
+    };
+  });
+  return c.json({ repo: true, worktrees });
 });
 
 app.post("/api/git/checkout", async (c) => {
@@ -490,6 +620,284 @@ app.post("/api/git/branch", async (c) => {
   const r = await runGit(rt().cwd, args);
   if (!r.ok) return c.json({ ok: false, error: r.error }, 500);
   return c.json({ ok: true, current: name });
+});
+
+// F05: file browser — single route dispatched by ?type=, borrowed from pi-web.
+// list: enumerate a directory (dirs first, IGNORED_NAMES filtered). read: text
+// content + language, or stream media (image/audio/PDF) with HTTP range support.
+// download: inline attachment. meta: size/language/mime without the body. watch:
+// SSE fs.watch for live preview refresh. All constrained to allowedRoots (the
+// live session cwds) so `../` can't read project-external files.
+// F06: skill management (pure-HTTP, self-contained to ~/.web-pi/skills — no
+// `npx skills` runtime dependency, per the user's (c) decision). List uses the
+// agent's own resourceLoader (zero drift with what the agent sees). Enable/
+// disable toggles SKILL.md frontmatter `disable-model-invocation` (surgical
+// line edit, preserves other YAML). Search hits skills.sh /api/search. Install
+// fetches SKILL.md from the GitHub source repo (located via the trees API) and
+// writes to ~/.web-pi/skills/<name>/ — discovered by the agent via the
+// additionalSkillPaths injected in createRuntime above.
+const SKILLS_API_BASE = process.env.SKILLS_API_URL || "https://skills.sh";
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
+
+function githubHeaders(): Record<string, string> {
+  const h: Record<string, string> = { Accept: "application/vnd.github+json", "User-Agent": "web-pi" };
+  if (GITHUB_TOKEN) h.Authorization = `Bearer ${GITHUB_TOKEN}`;
+  return h;
+}
+
+app.get("/api/skills", async (c) => {
+  const loader = rt(c).services.resourceLoader;
+  try { await loader.reload?.(); } catch { /* reload optional */ }
+  const { skills } = loader.getSkills();
+  return c.json({
+    skills: skills.map((s) => ({
+      name: s.name,
+      description: s.description,
+      filePath: s.filePath,
+      baseDir: s.baseDir,
+      disableModelInvocation: s.disableModelInvocation,
+    })),
+    skillsDir: WEB_PI_SKILLS_DIR,
+  });
+});
+
+app.patch("/api/skills", async (c) => {
+  const { filePath, disableModelInvocation } = await c.req.json<{ filePath?: string; disableModelInvocation?: boolean }>();
+  if (!filePath) return c.json({ error: "filePath required" }, 400);
+  if (!existsSync(filePath)) return c.json({ error: "file not found" }, 404);
+  const content = readFileSync(filePath, "utf8");
+  const key = "disable-model-invocation";
+  const { frontmatter } = parseFrontmatter<Record<string, unknown>>(content);
+  const alreadySet = Boolean(frontmatter[key]);
+  let updated = content;
+  if (disableModelInvocation && !alreadySet) {
+    updated = content.replace(/^---\r?\n/, `---\n${key}: true\n`);
+    if (updated === content) updated = `---\n${key}: true\n---\n${content}`;
+  } else if (!disableModelInvocation && alreadySet) {
+    updated = content.replace(new RegExp(`^${key}\\s*:.*\\r?\\n`, "m"), "");
+  }
+  if (updated !== content) await writeFile(filePath, updated, "utf8");
+  return c.json({ success: true });
+});
+
+app.post("/api/skills/search", async (c) => {
+  const { query, limit } = await c.req.json<{ query?: string; limit?: number }>();
+  if (!query?.trim()) return c.json({ error: "query required" }, 400);
+  const lim = Math.min(50, Math.max(1, Math.floor(Number(limit) || 20)));
+  try {
+    const res = await fetch(`${SKILLS_API_BASE}/api/search?q=${encodeURIComponent(query.trim())}&limit=${lim}`, { cache: "no-store" });
+    if (!res.ok) return c.json({ error: `skills.sh search failed (HTTP ${res.status})` }, 502);
+    const data = (await res.json()) as { skills?: Array<{ id?: string; name?: string; source?: string; installs?: number }> };
+    const results = (data.skills ?? [])
+      .map((s) => ({
+        package: s.id ?? `${s.source ?? ""}/${s.name ?? ""}`,
+        name: s.name ?? "",
+        installs: s.installs ?? 0,
+        url: s.id ? `${SKILLS_API_BASE}/${s.id}` : "",
+      }))
+      .sort((a, b) => b.installs - a.installs);
+    return c.json({ results });
+  } catch (e) {
+    return c.json({ error: String(e) }, 500);
+  }
+});
+
+// F06 install: locate SKILL.md in the source GitHub repo via the trees API,
+// fetch its raw content, write to ~/.web-pi/skills/<name>/SKILL.md. Best-effort:
+// if the tree call is rate-limited or the skill can't be located, surface a
+// clear error. Pure HTTP (no `npx skills`).
+app.post("/api/skills/install", async (c) => {
+  const { package: pkg, scope } = await c.req.json<{ package?: string; scope?: "global" | "project" }>();
+  if (!pkg?.trim()) return c.json({ error: "package required" }, 400);
+  // pkg = "owner/repo/skillName" (skills.sh id) or "owner/repo@skillName".
+  const cleaned = pkg.trim().replace(/^.*@/, "").replace(/^github:\//, "");
+  const parts = cleaned.split("/");
+  if (parts.length < 3) return c.json({ error: "package must be owner/repo/skillName" }, 400);
+  const [owner, repo, ...rest] = parts;
+  const skillName = rest.join("/");
+  const ownerEnc = encodeURIComponent(owner);
+  const repoEnc = encodeURIComponent(repo);
+  try {
+    const treeRes = await fetch(`https://api.github.com/repos/${ownerEnc}/${repoEnc}/git/trees/HEAD?recursive=1`, { headers: githubHeaders() });
+    if (!treeRes.ok) {
+      const detail = treeRes.status === 403 || treeRes.status === 429
+        ? "GitHub API rate-limited — set GITHUB_TOKEN env to raise the limit"
+        : `GitHub trees API HTTP ${treeRes.status}`;
+      return c.json({ error: detail }, 502);
+    }
+    const tree = (await treeRes.json()) as { tree?: Array<{ path?: string; type?: string }> };
+    // skills.sh's skillName can differ from the GitHub dir name (e.g. skillName
+    // "vercel-react-best-practices" but the repo dir is "react-best-practices").
+    // Match by the dir containing SKILL.md, via exact / suffix / contains
+    // (case-insensitive) — robust against prefix drift.
+    const lower = skillName.toLowerCase();
+    const blobs = (tree.tree ?? []).filter((t) => t.type === "blob" && t.path?.toLowerCase().endsWith("/skill.md"));
+    const dirName = (p?: string) => {
+      if (!p) return "";
+      const parts = p.toLowerCase().split("/"); // [..., "<dir>", "skill.md"]
+      return parts[parts.length - 2] ?? "";
+    };
+    const blob =
+      blobs.find((t) => dirName(t.path) === lower) ??
+      blobs.find((t) => { const d = dirName(t.path); return d && (lower.endsWith(d) || d.endsWith(lower) || lower.includes(d) || d.includes(lower)); }) ??
+      blobs.find((t) => t.path?.toLowerCase().includes(lower));
+    if (!blob?.path) return c.json({ error: `SKILL.md not found in ${owner}/${repo} matching ${skillName}` }, 404);
+    const rawRes = await fetch(`https://raw.githubusercontent.com/${ownerEnc}/${repoEnc}/HEAD/${blob.path}`, { headers: githubHeaders() });
+    if (!rawRes.ok) return c.json({ error: `fetch SKILL.md failed (HTTP ${rawRes.status})` }, 502);
+    const content = await rawRes.text();
+    // Write to global ~/.web-pi/skills/<name>/SKILL.md (project-scope deferred —
+    // the agent's additionalSkillPaths covers the global dir; project-scope would
+    // need a per-cwd dir + that cwd's loader config).
+    const skillDir = join(WEB_PI_SKILLS_DIR, skillName);
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, "SKILL.md"), content, "utf8");
+    return c.json({ success: true, name: skillName, path: join(skillDir, "SKILL.md"), source: `${owner}/${repo}` });
+  } catch (e) {
+    return c.json({ error: String(e) }, 500);
+  }
+});
+
+app.post("/api/skills/uninstall", async (c) => {
+  const { name } = await c.req.json<{ name?: string }>();
+  if (!name?.trim()) return c.json({ error: "name required" }, 400);
+  const skillDir = join(WEB_PI_SKILLS_DIR, name.trim());
+  if (!skillDir.startsWith(WEB_PI_SKILLS_DIR)) return c.json({ error: "invalid name" }, 400);
+  try { await rm(skillDir, { recursive: true, force: true }); return c.json({ success: true }); }
+  catch (e) { return c.json({ error: String(e) }, 500); }
+});
+
+app.get("/api/files/*", async (c) => {
+  const reqPath = c.req.path.replace(/^\/api\/files\/?/, "");
+  const filePath = reqPath ? "/" + reqPath : "/";
+  const type = (c.req.query("type") ?? "list") as "list" | "read" | "download" | "meta" | "watch";
+  const roots = allowedRootsFn([...sessions.values()].map((rt) => ({ cwd: rt.cwd })));
+  if (!isPathAllowed(filePath, roots)) {
+    return c.json({ error: "access denied (outside session cwd)" }, 403);
+  }
+  let stat: fs.Stats;
+  try {
+    stat = statSync(filePath);
+  } catch {
+    return c.json({ error: "not found" }, 404);
+  }
+
+  if (type === "list") {
+    if (!stat.isDirectory()) return c.json({ error: "not a directory" }, 400);
+    const dirents = readdirSync(filePath, { withFileTypes: true });
+    const entries = dirents
+      .filter((d) => !IGNORED_NAMES.has(d.name) && !IGNORED_SUFFIXES.some((s) => d.name.endsWith(s)))
+      .map((d) => {
+        const isDir = resolveDirentIsDirectory(d, path.join(filePath, d.name));
+        return isDir === null ? null : { name: d.name, isDir };
+      })
+      .filter((x): x is { name: string; isDir: boolean } => x !== null)
+      .sort((a, b) => (a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name)));
+    return c.json({ entries, path: filePath });
+  }
+
+  if (!stat.isFile()) return c.json({ error: "not a file" }, 400);
+
+  if (type === "meta") {
+    return c.json({
+      size: stat.size,
+      language: getLanguage(filePath),
+      mime: getImageMime(filePath) || getAudioMime(filePath) || (isPdfPath(filePath) ? "application/pdf" : "text/plain"),
+      isImage: getImageMime(filePath) !== null,
+      isAudio: getAudioMime(filePath) !== null,
+      isPdf: isPdfPath(filePath),
+    });
+  }
+
+  // download: inline (browser renders or saves).
+  if (type === "download") {
+    const mime = getImageMime(filePath) || getAudioMime(filePath) || (isPdfPath(filePath) ? "application/pdf" : "application/octet-stream");
+    const data = readFileSync(filePath);
+    return new Response(data, {
+      headers: {
+        "Content-Type": mime,
+        "Cache-Control": "no-cache",
+        "Content-Disposition": `inline; filename="${path.basename(filePath)}"`,
+      },
+    });
+  }
+
+  // read: text → {content,language}; media/pdf → stream bytes (with range).
+  const imageMime = getImageMime(filePath);
+  if (imageMime) {
+    if (stat.size > IMAGE_PREVIEW_MAX_BYTES) return c.json({ error: "image too large (>10MB)" }, 413);
+    return streamFile(filePath, stat, imageMime, c.req.header("range") ?? null);
+  }
+  const audioMime = getAudioMime(filePath);
+  if (audioMime) return streamFile(filePath, stat, audioMime, c.req.header("range") ?? null);
+  if (isPdfPath(filePath)) return streamFile(filePath, stat, "application/pdf", c.req.header("range") ?? null);
+
+  // text
+  if (stat.size > TEXT_PREVIEW_MAX_BYTES) return c.json({ error: "file too large for preview (>256KB)" }, 413);
+  const content = readFileSync(filePath, "utf-8");
+  return c.json({ content, language: getLanguage(filePath), size: stat.size });
+
+  function streamFile(p: string, s: fs.Stats, contentType: string, rangeHeader: string | null) {
+    const headers = {
+      "Content-Type": contentType,
+      "Cache-Control": "no-cache",
+      "Accept-Ranges": "bytes",
+      "Content-Disposition": `inline; filename="${path.basename(p)}"`,
+    };
+    if (!rangeHeader) {
+      const stream = createReadStream(p);
+      return new Response(stream as unknown as ReadableStream, { headers: { ...headers, "Content-Length": String(s.size) } });
+    }
+    const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
+    if (!m) return new Response(null, { status: 416, headers: { ...headers, "Content-Range": `bytes */${s.size}` } });
+    let start = m[1] ? Number(m[1]) : 0;
+    let end = m[2] ? Number(m[2]) : s.size - 1;
+    if (!m[1] && m[2]) { start = Math.max(s.size - Number(m[2]), 0); end = s.size - 1; }
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= s.size) {
+      return new Response(null, { status: 416, headers: { ...headers, "Content-Range": `bytes */${s.size}` } });
+    }
+    end = Math.min(end, s.size - 1);
+    const stream = createReadStream(p, { start, end });
+    return new Response(stream as unknown as ReadableStream, {
+      status: 206,
+      headers: { ...headers, "Content-Length": String(end - start + 1), "Content-Range": `bytes ${start}-${end}/${s.size}` },
+    });
+  }
+});
+
+// F05: SSE file watch — emits `change` on fs.watch so the frontend re-fetches
+// (live preview refresh for logs/generated files).
+app.get("/api/files-watch", (c) => {
+  const filePath = c.req.query("path") ?? "";
+  const roots = allowedRootsFn([...sessions.values()].map((rt) => ({ cwd: rt.cwd })));
+  if (!filePath || !isPathAllowed(filePath, roots)) return c.json({ error: "access denied" }, 403);
+  const encoder = new TextEncoder();
+  let watcher: fs.FSWatcher | null = null;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const send = (event: string, data: unknown) => {
+        try { controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)); } catch { /* closed */ }
+      };
+      send("connected", { filePath });
+      try {
+        watcher = fs.watch(filePath, () => {
+          try {
+            const s = statSync(filePath);
+            send("change", { mtime: s.mtime.toISOString(), size: s.size });
+          } catch {
+            send("change", { mtime: new Date().toISOString(), size: 0 });
+          }
+        });
+        watcher.on("error", () => { try { controller.close(); } catch { /* */ } });
+      } catch {
+        send("error", { message: "failed to watch" });
+        controller.close();
+      }
+    },
+    cancel() { try { watcher?.close(); } catch { /* */ } },
+  });
+  return new Response(stream, {
+    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" },
+  });
 });
 
 app.get("/api/dirs", (c) => {
@@ -949,11 +1357,17 @@ app.get("/api/events", (c) => {
         }
       };
       const s = rt(c).session;
+      const rt_ = rt(c);
       const m = s.model;
       send({
         type: "session_init",
         sessionId: s.sessionId,
-        cwd: rt().cwd,
+        // BUG FIX (F04 surfaced): use rt(c).cwd (this connection's runtime),
+        // NOT rt().cwd — rt() with no arg returns the FIRST live session, so
+        // every session_init used to report the first session's cwd regardless
+        // of which session the SSE was for. Switching cwd/worktree now reports
+        // the correct cwd.
+        cwd: rt_.cwd,
         model: m ? { id: m.id, provider: m.provider } : null,
         thinking: s.thinkingLevel,
         availableThinkingLevels: s.getAvailableThinkingLevels(),

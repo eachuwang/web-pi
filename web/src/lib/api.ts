@@ -8,15 +8,21 @@ function sid(sessionId?: string): string {
   return sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
 }
 
+// F01: image attachment. Mirrors the SDK's ImageContent — `data` is raw base64
+// (no `data:` prefix), `mimeType` is the image MIME. Frontend reads dropped /
+// pasted files into this shape via FileReader.
+export type ImageContent = { type: "image"; data: string; mimeType: string };
+
 export async function sendPrompt(
   message: string,
   streamingBehavior?: "steer" | "followUp",
   sessionId?: string,
+  images?: ImageContent[],
 ): Promise<{ accepted: boolean; error?: string }> {
   const res = await fetch(`${API_BASE}/api/prompt${sid(sessionId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, streamingBehavior }),
+    body: JSON.stringify({ message, streamingBehavior, images }),
   });
   return (await res.json()) as { accepted: boolean; error?: string };
 }
@@ -74,6 +80,24 @@ export async function setThinkingLevel(
 export async function abortRun(sessionId?: string): Promise<{ aborted: boolean }> {
   const res = await fetch(`${API_BASE}/api/abort${sid(sessionId)}`, { method: "POST" });
   return (await res.json()) as { aborted: boolean };
+}
+
+// F03: session fork. `forkPoints` lists user messages the SDK can fork from
+// (entryId + text); `forkSession` branches from one (position:"at") and
+// returns the new sessionId — the frontend switches activeSessionId to it,
+// which reopens SSE and rebuilds from the new session's snapshot.
+export type ForkPoint = { entryId: string; text: string };
+export async function getForkPoints(sessionId?: string): Promise<{ points: ForkPoint[] }> {
+  const res = await fetch(`${API_BASE}/api/fork-points${sid(sessionId)}`);
+  return (await res.json()) as { points: ForkPoint[] };
+}
+export async function forkSession(entryId: string, sessionId?: string): Promise<{ ok: boolean; sessionId?: string; error?: string }> {
+  const res = await fetch(`${API_BASE}/api/fork${sid(sessionId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ entryId }),
+  });
+  return (await res.json()) as { ok: boolean; sessionId?: string; error?: string };
 }
 
 export async function compactNow(customInstructions?: string, sessionId?: string): Promise<{ ok: boolean; error?: string }> {
@@ -179,9 +203,8 @@ export async function deleteSession(path: string): Promise<{ ok: boolean; error?
 
 export type GitInfo = { repo: boolean; current: string; branches: string[] };
 
-export async function getGitBranch(cwd?: string): Promise<GitInfo> {
-  const q = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
-  const res = await fetch(`${API_BASE}/api/git/branch${q}`);
+export async function getGitBranch(sessionId?: string): Promise<GitInfo> {
+  const res = await fetch(`${API_BASE}/api/git/branch${sid(sessionId)}`);
   return (await res.json()) as GitInfo;
 }
 
@@ -192,6 +215,15 @@ export async function gitCheckout(branch: string): Promise<{ ok: boolean; curren
     body: JSON.stringify({ branch }),
   });
   return (await res.json()) as { ok: boolean; current?: string; error?: string };
+}
+
+// F04: git worktree list. Switching to a worktree = switchSession(worktreePath)
+// on the client (a new live session in that cwd); this just enumerates them.
+export type Worktree = { path: string; head: string; branch: string; isMain: boolean };
+export async function getWorktrees(cwd?: string): Promise<{ repo: boolean; worktrees: Worktree[] }> {
+  const q = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
+  const res = await fetch(`${API_BASE}/api/git/worktrees${q}`);
+  return (await res.json()) as { repo: boolean; worktrees: Worktree[] };
 }
 
 export async function gitCreateBranch(

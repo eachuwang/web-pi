@@ -1,9 +1,15 @@
 # web-pi
 
-> A self-hosted, **self-contained** web UI + dashboard for the
-> [pi](https://pi.dev) coding agent, built on the
-> `@earendil-works/pi-coding-agent` SDK. One Node process hosts an agent
-> session in-process and serves a React frontend over HTTP + SSE. It does
+> A **minimalist** web UI for the [pi](https://pi.dev) coding agent —
+> built for developers who want the power of pi with a clean, distraction-free
+> interface, plus easy management of skills, extensions, and external
+> capabilities.
+>
+> 一个拥有**极简 Web UI** 的 pi，让你专注于对话和编码；同时提供便捷的技能管理、
+> 扩展配置和外置能力接入——所有操作都在浏览器里完成。
+>
+> Built on the `@earendil-works/pi-coding-agent` SDK. One Node process hosts an
+> agent session in-process and serves a React frontend over HTTP + SSE. It does
 > **not** require a pi install — you configure your model provider in the UI.
 
 [English](#english) · [中文](#中文)

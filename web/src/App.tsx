@@ -6,7 +6,9 @@ import {
   compactNow,
   deleteSession,
   disposeSession,
+  forkSession,
   getCommands,
+  getForkPoints,
   getGitBranch,
   getMessages,
   getModels,
@@ -22,11 +24,13 @@ import {
   switchSession,
   type GitInfo,
   type HistMessage,
+  type ImageContent,
   type ModelInfo,
   type SessionListItem,
   type SessionStat,
   type SlashCommand,
   type UsageData,
+  type ForkPoint,
 } from "./lib/api";
 import { useEventStream, type AgentEvent } from "./hooks/useEventStream";
 import { CwdPicker } from "./components/CwdPicker";
@@ -34,6 +38,10 @@ import { GitBranchPicker } from "./components/GitBranchPicker";
 import { SkillPicker } from "./components/SkillPicker";
 import { SettingsDrawer } from "./components/SettingsDrawer";
 import { Sidebar } from "./components/Sidebar";
+import { WorktreePicker } from "./components/WorktreePicker";
+import { FileExplorer } from "./components/FileExplorer";
+import { FileViewer } from "./components/FileViewer";
+import { SkillsPanel } from "./components/SkillsPanel";
 import type { LiveSession } from "./lib/api";
 
 type Seg =
@@ -183,6 +191,10 @@ export function App() {
   // so a consumed steer reads like a normal back-and-forth [user][assistant].
   const pendingSteerBubbleRef = useRef(false);
   const [input, setInput] = useState("");
+  // F01: image attachments. `previewUrl` is a blob URL for the chip thumbnail;
+  // `data`/`mimeType` is the ImageContent payload sent to the backend. Capped
+  // at 4 images / 5MB each (matches the server cap). Cleared on send.
+  const [images, setImages] = useState<Array<{ name: string; data: string; mimeType: string; previewUrl: string }>>([]);
   const [session, setSession] = useState<{ id: string; cwd: string } | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [liveSessions, setLiveSessions] = useState<LiveSession[]>([]);
@@ -197,6 +209,12 @@ export function App() {
   // desync). null = not yet loaded → show the full ladder.
   const [availableThinking, setAvailableThinking] = useState<string[] | null>(null);
   const [queue, setQueue] = useState<{ steer: string[]; follow: string[] }>({ steer: [], follow: [] });
+  // F02: topbar status. `compacting` flashes during context compaction;
+  // `retry` flashes during auto-retry. Both surfaced in the topbar strip
+  // (replacing the old main-chat pushSystem lines) so the user sees run state
+  // at a glance without scrolling. Cleared on the matching *_end event.
+  const [compacting, setCompacting] = useState(false);
+  const [retry, setRetry] = useState<{ attempt: number; maxAttempts: number } | null>(null);
   const [stats, setStats] = useState<SessionStat | null>(null);
   const [usage, setUsage] = useState<UsageData | null>(null);
   const [sessionsList, setSessionsList] = useState<SessionListItem[]>([]);
@@ -205,7 +223,23 @@ export function App() {
   const [gitInfo, setGitInfo] = useState<GitInfo | null>(null);
   const [branchPicker, setBranchPicker] = useState(false);
   const [skillPicker, setSkillPicker] = useState(false);
+  // F04: git worktree picker. Switching = doSwitch(worktreePath) → new live
+  // session in that cwd.
+  const [wtPicker, setWtPicker] = useState(false);
+  // F05: file browser. `filesOpen` toggles the left explorer drawer; `viewerFile`
+  // opens the right viewer drawer for a file path. Mention inserts a relative
+  // path into the chat input (plain text, per F05 grill).
+  const [filesOpen, setFilesOpen] = useState(false);
+  const [viewerFile, setViewerFile] = useState<string | null>(null);
+  // F06: skills management panel (search/install/enable-disable).
+  const [skillsOpen, setSkillsOpen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  // F03: session fork picker. `forkPoints` lists user messages forkable from;
+  // picking one POSTs /api/fork and switches activeSessionId to the new
+  // (branched) session — SSE reopens + applySnapshot rebuilds the chat.
+  const [forkPicker, setForkPicker] = useState(false);
+  const [forkPoints, setForkPoints] = useState<ForkPoint[]>([]);
+  const [forking, setForking] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [slashCmds, setSlashCmds] = useState<SlashCommand[]>([]);
@@ -271,7 +305,10 @@ export function App() {
   };
   const fetchGit = async () => {
     try {
-      setGitInfo(await getGitBranch());
+      // F04: pass activeSessionId so the backend resolves THIS session's cwd
+      // (rt(c)) instead of the first live session — otherwise switching
+      // cwd/worktree leaves the git branch display stale.
+      setGitInfo(await getGitBranch(activeSessionId ?? undefined));
     } catch {
       setGitInfo(null);
     }
@@ -409,7 +446,8 @@ export function App() {
           // carrying the errorMessage). Without this the user sees the reply
           // stop with no indication whether it's done or retrying.
           if ((e as { willRetry?: boolean }).willRetry) {
-            pushSystem("回合结束，将自动重试…", "a");
+            // F02: the SDK will follow with auto_retry_start — the topbar retry
+            // indicator covers this, no main-chat line needed.
           }
           void fetchStats();
           void fetchUsage();
@@ -517,28 +555,30 @@ export function App() {
           break;
         }
         case "compaction_start":
-          pushSystem("context: compacting…", "a");
+          // F02: topbar indicator replaces the old main-chat pushSystem.
+          setCompacting(true);
           break;
         case "compaction_end": {
           const ce = e as { errorMessage?: string; aborted?: boolean; willRetry?: boolean };
+          setCompacting(false);
+          // Success/abort → topbar only; a genuine compaction ERROR still merits
+          // a main-chat line (it's actionable).
           if (ce.errorMessage) pushSystem(`⚠ 上下文压缩失败：${ce.errorMessage}`, "err");
-          else if (ce.aborted) pushSystem("context: compact aborted", "a");
-          else pushSystem("context: compacted", "ok");
           void fetchStats();
           break;
         }
-        // Error surfacing (the user wants any error/exception visible in the
-        // main chat, not silent). auto_retry fires when an upstream request
-        // failed and the SDK is retrying; auto_retry_end reports the outcome.
+        // F02: auto_retry now drives a topbar indicator instead of main-chat
+        // lines. A final failure (success=false after all attempts) is still
+        // surfaced in chat as an actionable error.
         case "auto_retry_start": {
           const ar = e as { attempt?: number; maxAttempts?: number; errorMessage?: string };
-          pushSystem(`⚠ 请求失败，重试中 (${ar.attempt ?? "?"}/${ar.maxAttempts ?? "?"})：${ar.errorMessage ?? ""}`, "err");
+          if (ar.attempt && ar.maxAttempts) setRetry({ attempt: ar.attempt, maxAttempts: ar.maxAttempts });
           break;
         }
         case "auto_retry_end": {
           const ar = e as { success?: boolean; attempt?: number; finalError?: string };
-          if (ar.success) pushSystem("已恢复，继续回复", "ok");
-          else pushSystem(`⚠ 重试 ${ar.attempt ?? "?"} 次仍失败：${ar.finalError ?? ""}`, "err");
+          setRetry(null);
+          if (!ar.success) pushSystem(`⚠ 重试 ${ar.attempt ?? "?"} 次仍失败：${ar.finalError ?? ""}`, "err");
           break;
         }
         case "message_end": {
@@ -602,9 +642,68 @@ export function App() {
   const isExpanded = (s: Seg): boolean =>
     s.kind === "thinking" ? !s.done || expanded.has(s.id) : s.kind === "tool" ? expanded.has(s.id) : true;
 
+  // F01: read dropped/pasted files into ImageContent (base64, no data: prefix)
+  // + a blob preview URL. Caps at MAX_IMAGES total and rejects files over
+  // MAX_IMG_BYTES (≈5MB) with an inline system note so the user knows why a
+  // paste vanished. Non-image files are silently skipped (the chat surface is
+  // text+image, not arbitrary file attach — file browse/attach is F05/F01-later).
+  const MAX_IMAGES = 4;
+  const MAX_IMG_BYTES = 5 * 1024 * 1024;
+  const addFiles = (fileList: FileList | File[]) => {
+    const incoming = Array.from(fileList).filter((f) => f.type.startsWith("image/"));
+    if (incoming.length === 0) return;
+    setImages((prev) => {
+      const room = MAX_IMAGES - prev.length;
+      if (room <= 0) {
+        pushSystem(`图片上限 ${MAX_IMAGES} 张，未添加新图`, "err");
+        return prev;
+      }
+      const accepted: Array<{ name: string; data: string; mimeType: string; previewUrl: string }> = [];
+      for (const f of incoming) {
+        if (accepted.length >= room) {
+          pushSystem(`图片上限 ${MAX_IMAGES} 张，部分未添加`, "err");
+          break;
+        }
+        if (f.size > MAX_IMG_BYTES) {
+          pushSystem(`图片过大未添加（${f.name}，>5MB）`, "err");
+          continue;
+        }
+        accepted.push({
+          name: f.name,
+          mimeType: f.type,
+          data: "", // filled by the async reader below
+          previewUrl: URL.createObjectURL(f),
+        });
+      }
+      if (accepted.length === 0) return prev;
+      // Read each accepted file's base64 asynchronously; the chip renders from
+      // previewUrl immediately, data fills in before send.
+      for (let i = 0; i < accepted.length; i++) {
+        const chip = accepted[i];
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = String(reader.result ?? "");
+          // result = "data:<mime>;base64,<base64>"
+          const m = /^data:[^;]+;base64,(.+)$/.exec(result);
+          const data = m ? m[1] : "";
+          setImages((cur) => cur.map((it) => (it === chip ? { ...it, data } : it)));
+        };
+        reader.readAsDataURL(incoming.find((f) => f.name === chip.name && f.type === chip.mimeType) ?? incoming[0]);
+      }
+      return [...prev, ...accepted];
+    });
+  };
+  const removeImage = (idx: number) => {
+    setImages((prev) => {
+      const [removed] = prev.filter((_, i) => i === idx);
+      if (removed) URL.revokeObjectURL(removed.previewUrl);
+      return prev.filter((_, i) => i !== idx);
+    });
+  };
+
   const submit = async () => {
     const text = input.trim();
-    if (!text) return;
+    if (!text && images.length === 0) return;
     if (text.startsWith("/")) {
       const cmd = text.split(/\s+/)[0] ?? "";
       if (META_COMMANDS.some((m) => m.cmd === cmd)) {
@@ -614,6 +713,12 @@ export function App() {
       }
     }
     stickBottom.current = true;
+    // F01: only send images whose base64 has finished reading; drop chips
+    // still loading data silently (the reader will have surfaced a note if it
+    // failed). Build the ImageContent payload from attached images.
+    const imgPayload: ImageContent[] = images
+      .filter((im) => im.data)
+      .map((im) => ({ type: "image", data: im.data, mimeType: im.mimeType }));
     // While the model is streaming, a new message is a STEER: it's queued
     // (streamingBehavior:"steer") and shown in the dashboard Queue panel via
     // queue_update — NOT appended to the chat list here. It's appended as a
@@ -623,11 +728,14 @@ export function App() {
     // When not streaming, the message is a normal prompt → appended here, and
     // the server emits agent_start, which appends a fresh assistant entry.
     if (!streaming) {
-      listRef.current = [...listRef.current, { kind: "user", id: nextId(), text }];
+      listRef.current = [...listRef.current, { kind: "user", id: nextId(), text: text || (imgPayload.length ? "📎 image" : "") }];
     }
     setInput("");
+    // Revoke blob URLs after sending (preview chips clear below).
+    for (const im of images) URL.revokeObjectURL(im.previewUrl);
+    setImages([]);
     try {
-      const r = await sendPrompt(text, streaming ? "steer" : undefined, activeSessionId ?? undefined);
+      const r = await sendPrompt(text, streaming ? "steer" : undefined, activeSessionId ?? undefined, imgPayload.length ? imgPayload : undefined);
       if (!r.accepted) pushSystem(`prompt rejected: ${r.error ?? ""}`, "err");
     } catch (e) {
       pushSystem(`network: ${String(e)}`, "err");
@@ -713,6 +821,7 @@ export function App() {
     listRef.current = [];
     setStats(null);
     setQueue({ steer: [], follow: [] });
+    setImages((prev) => { for (const im of prev) URL.revokeObjectURL(im.previewUrl); return []; });
     pushSystem(`${sessionPath ? "resume" : "new session"} → ${newCwd}`, "a");
     try {
       const r = await switchSession(newCwd, sessionPath);
@@ -736,10 +845,52 @@ export function App() {
     listRef.current = [];
     setStats(null);
     setQueue({ steer: [], follow: [] });
+    setImages((prev) => { for (const im of prev) URL.revokeObjectURL(im.previewUrl); return []; });
     setActiveSessionId(id);
   };
   const newSession = async () => {
     await doSwitch(session?.cwd ?? ".");
+  };
+  // F03: open the fork picker — fetches user messages forkable from the SDK
+  // (entryId + text). The picker shows them as a list; picking one forks.
+  const openForkPicker = async () => {
+    if (streaming) {
+      pushSystem("fork: wait for the current turn to finish", "err");
+      return;
+    }
+    try {
+      const r = await getForkPoints(activeSessionId ?? undefined);
+      setForkPoints(r.points ?? []);
+      setForkPicker(true);
+    } catch (e) {
+      pushSystem(`fork: ${String(e)}`, "err");
+    }
+  };
+  // F03: fork from a user message (position:"at" → that message is the new
+  // leaf, anything after it is dropped). On success the backend re-keys the
+  // runtime to the branched sessionId; we switch activeSessionId to it so SSE
+  // reopens and applySnapshot rebuilds the chat from the forked history.
+  const doFork = async (entryId: string) => {
+    setForking(true);
+    try {
+      const r = await forkSession(entryId, activeSessionId ?? undefined);
+      if (r.ok && r.sessionId) {
+        setForkPicker(false);
+        pushSystem(`forked → new session`, "ok");
+        listRef.current = [];
+        setStats(null);
+        setQueue({ steer: [], follow: [] });
+        setImages((prev) => { for (const im of prev) URL.revokeObjectURL(im.previewUrl); return []; });
+        setActiveSessionId(r.sessionId);
+        void fetchLiveSessions();
+      } else {
+        pushSystem(`fork: ${r.error ?? "failed"}`, "err");
+      }
+    } catch (e) {
+      pushSystem(`fork: ${String(e)}`, "err");
+    } finally {
+      setForking(false);
+    }
   };
   const doRename = async (id: string, title: string) => {
     const r = await renameSession(id, title);
@@ -836,6 +987,23 @@ export function App() {
         <div className="head-right">
           <span className={`pill ${liveState}`}>·{liveState === "on" ? "live" : liveState}</span>
           <button
+            className="gear"
+            onClick={() => setSkillsOpen(true)}
+            title="skills — search / install / enable-disable"
+            aria-label="skills"
+          >
+            ⚡
+          </button>
+          <button
+            className="gear"
+            onClick={() => void openForkPicker()}
+            disabled={streaming}
+            title="fork — branch a new session from a past user message"
+            aria-label="fork session"
+          >
+            ↳
+          </button>
+          <button
             className={`gear ${showSettings ? "on" : ""}`}
             onClick={() => setShowSettings((v) => !v)}
             title="settings — model providers"
@@ -845,6 +1013,29 @@ export function App() {
           </button>
         </div>
       </header>
+
+      {/* F02: topbar status strip — context % + cost + compaction/retry
+          indicator. Replaces the old main-chat pushSystem lines for these
+          transient run states (kept in chat only for genuine errors). Narrow
+          screens collapse to context% + status. */}
+      <div className="topbar">
+        <span className="tb-ctx" title={`context: ${human(stats?.contextUsage?.tokens ?? 0)} / ${human(stats?.contextUsage?.contextWindow ?? 0)} tokens`}>
+          <span className="tb-label">ctx</span>
+          <span className="tb-bar">
+            <span style={{ width: `${Math.min(100, Math.max(0, ctxPct ?? 0))}%` }} />
+          </span>
+          <span className="tb-pct">{ctxPct === null ? "—" : `${ctxPct.toFixed(1)}%`}</span>
+        </span>
+        <span className="tb-cost" title="this session · all time">
+          <span className="tb-label">$</span>
+          {money(stats?.cost ?? 0)}<span className="tb-dim"> · {money(usage?.total.cost ?? 0)}</span>
+        </span>
+        <span className="tb-status">
+          {compacting && (<span className="tb-flag warn" title="compacting context">compacting…</span>)}
+          {retry && (<span className="tb-flag warn" title="auto-retry in progress">{`retry ${retry.attempt}/${retry.maxAttempts}…`}</span>)}
+          {streaming && !compacting && !retry && (<span className="tb-flag live" title="streaming">streaming</span>)}
+        </span>
+      </div>
 
       <div className="wrap">
         <div className={`layout${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
@@ -985,7 +1176,17 @@ export function App() {
               </div>
             )}
 
-            <div className="composer">
+            <div
+              className="composer"
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "copy";
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                if (e.dataTransfer.files?.length) addFiles(e.dataTransfer.files);
+              }}
+            >
               {slashOpen && (
                 <div className="slash-menu">
                   {slashFiltered.map((c, i) => (
@@ -1001,6 +1202,23 @@ export function App() {
                   ))}
                 </div>
               )}
+              {images.length > 0 && (
+                <div className="img-chips">
+                  {images.map((im, i) => (
+                    <div className="img-chip" key={`${i}-${im.name}`}>
+                      <img src={im.previewUrl} alt={im.name} />
+                      <button
+                        className="img-chip-x"
+                        title="remove image"
+                        onClick={() => removeImage(i)}
+                      >
+                        ✕
+                      </button>
+                      {!im.data && <span className="img-chip-loading" title="reading file…">…</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
               <textarea
                 ref={inputRef}
                 value={input}
@@ -1009,7 +1227,14 @@ export function App() {
                   setSlashIndex(0);
                 }}
                 onKeyDown={onKeyDown}
-                placeholder="Message web-pi… (Enter send · Shift+Enter newline · type / for commands)"
+                onPaste={(e) => {
+                  const files = e.clipboardData?.files;
+                  if (files?.length) {
+                    e.preventDefault();
+                    addFiles(files);
+                  }
+                }}
+                placeholder="Message web-pi… (Enter send · Shift+Enter newline · type / for commands · drop/paste images)"
                 rows={2}
                 autoFocus
               />
@@ -1068,9 +1293,15 @@ export function App() {
               <button className="cwd-btn" onClick={() => setPicker(true)} title="switch cwd / resume session">
                 <span className="cwd">{session?.cwd ?? "…"}</span> <span className="arr" />
               </button>
+              <button className="cwd-btn" onClick={() => setFilesOpen((v) => !v)} title="browse files — preview source/image/PDF/audio">
+                <span className="cwd">files</span> <span className="arr" />
+              </button>
               <span className="ctrl-label">git</span>
               <button className="git-btn" onClick={() => setBranchPicker(true)} disabled={!gitInfo?.repo} title={gitInfo?.repo ? gitInfo.current : "not a git repo"}>
                 <span className="branch-name">{gitInfo ? (gitInfo.repo ? gitInfo.current : "no git") : "…"}</span> <span className="arr" />
+              </button>
+              <button className="git-btn" onClick={() => setWtPicker(true)} disabled={!gitInfo?.repo} title="git worktrees — switch cwd to another working tree">
+                <span className="branch-name">worktree</span> <span className="arr" />
               </button>
             </div>
           </section>
@@ -1203,6 +1434,35 @@ export function App() {
       {branchPicker && (
         <GitBranchPicker onClose={() => setBranchPicker(false)} onChanged={() => void fetchGit()} />
       )}
+      {wtPicker && (
+        <WorktreePicker
+          cwd={session?.cwd ?? "."}
+          onClose={() => setWtPicker(false)}
+          onSwitch={(path) => {
+            setWtPicker(false);
+            void doSwitch(path);
+          }}
+        />
+      )}
+      {/* F05: file explorer (left drawer) + file viewer (right drawer overlay). */}
+      {filesOpen && (
+        <div className="fe-overlay" onClick={(e) => e.target === e.currentTarget && setFilesOpen(false)}>
+          <FileExplorer
+            cwd={session?.cwd ?? "."}
+            onOpenFile={(p) => setViewerFile(p)}
+            onMention={(rel) => {
+              setInput((cur) => (cur ? `${cur} ${rel}` : rel));
+              inputRef.current?.focus();
+            }}
+          />
+        </div>
+      )}
+      {viewerFile && (
+        <FileViewer filePath={viewerFile} cwd={session?.cwd ?? "."} onClose={() => setViewerFile(null)} />
+      )}
+      {skillsOpen && (
+        <SkillsPanel sessionId={activeSessionId ?? undefined} onClose={() => setSkillsOpen(false)} />
+      )}
       {skillPicker && (
         <SkillPicker
           skills={slashCmds.filter((c) => c.kind === "skill")}
@@ -1213,6 +1473,43 @@ export function App() {
             inputRef.current?.focus();
           }}
         />
+      )}
+      {forkPicker && (
+        <div
+          className="modal"
+          style={{ zIndex: 60 }}
+          onClick={(e) => e.target === e.currentTarget && !forking && setForkPicker(false)}
+        >
+          <div className="sheet" style={{ maxWidth: 560 }}>
+            <header className="sheet-head">
+              <div className="sheet-title">fork from a user message</div>
+              <div className="x" onClick={() => !forking && setForkPicker(false)}>✕</div>
+            </header>
+            <div className="sheet-body">
+              <div className="fork-hint">
+                Pick a past user message to branch a new session from. Everything
+                after it is dropped; the original session is untouched.
+              </div>
+              {forkPoints.length === 0 ? (
+                <div className="empty">no forkable user messages yet — send one first</div>
+              ) : (
+                <div className="fork-list">
+                  {forkPoints.map((p, i) => (
+                    <button
+                      key={p.entryId ?? i}
+                      className="fork-item"
+                      disabled={forking}
+                      onClick={() => void doFork(p.entryId)}
+                    >
+                      <span className="fork-idx">{i + 1}</span>
+                      <span className="fork-text">{p.text.slice(0, 120)}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
       {showSettings && (
         <SettingsDrawer
