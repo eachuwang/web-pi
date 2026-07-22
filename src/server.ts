@@ -134,7 +134,7 @@ const sessionMeta = new Map<string, { cwd: string; title?: string; created: numb
 const sessionLastEvent = new Map<string, number>();
 const maxSessions = () => settingsState.maxSessions ?? 4;
 
-async function makeSession(opts: { cwd: string; sessionPath?: string }): Promise<AgentSessionRuntime> {
+async function makeSession(opts: { cwd: string; sessionPath?: string; created?: number }): Promise<AgentSessionRuntime> {
   if (sessions.size >= maxSessions()) {
     throw new Error(`max sessions reached (${maxSessions()})`);
   }
@@ -145,7 +145,7 @@ async function makeSession(opts: { cwd: string; sessionPath?: string }): Promise
     sessionManager: sm,
   });
   sessions.set(runtime.session.sessionId, runtime);
-  sessionMeta.set(runtime.session.sessionId, { cwd: opts.cwd, created: Date.now() });
+  sessionMeta.set(runtime.session.sessionId, { cwd: opts.cwd, created: opts.created ?? Date.now() });
   return runtime;
 }
 
@@ -168,7 +168,38 @@ function rt(c?: Ctx): AgentSessionRuntime {
 }
 
 // default session at startup
-await makeSession({ cwd });
+// G01-restore: resume the most recent saved sessions for the startup cwd
+// instead of always creating a fresh empty one. The live set (sessions +
+// sessionMeta Maps) is in-memory, so without this a restart wiped every prior
+// session from the sidebar — only resumable via the cwd picker. Session JSONL
+// files live in ~/.pi/agent/sessions (SDK SessionManager). Restore up to
+// maxSessions, most-recent first (SessionManager.list returns modified-desc);
+// the first restored becomes the default active session (pick() returns the
+// first live one). Genuine first run (no saved sessions) → fresh empty session.
+async function restoreSessions(startupCwd: string): Promise<void> {
+  let saved: Awaited<ReturnType<typeof SessionManager.list>> = [];
+  try {
+    saved = await SessionManager.list(startupCwd);
+  } catch (e) {
+    console.warn(`[web-pi] restore: listing saved sessions failed: ${String(e)}`);
+  }
+  if (saved.length === 0) {
+    await makeSession({ cwd: startupCwd });
+    return;
+  }
+  const cap = maxSessions();
+  for (const s of saved.slice(0, cap)) {
+    try {
+      await makeSession({ cwd: s.cwd || startupCwd, sessionPath: s.path, created: s.created.getTime() });
+    } catch (e) {
+      // one unreadable/locked file shouldn't block startup — keep going
+      console.warn(`[web-pi] restore: failed to resume ${s.path}: ${String(e)}`);
+    }
+  }
+  // nothing could be restored (all files failed) → keep the app usable
+  if (sessions.size === 0) await makeSession({ cwd: startupCwd });
+}
+await restoreSessions(cwd);
 
 // G02 cost odometer flush: every 15s snapshot all live sessions into
 // ~/.web-pi/usage.json. Idempotent (snapshot-overwrite per sessionFile), so
