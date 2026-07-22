@@ -23,13 +23,18 @@ export function CwdPicker({
 
   const load = async (p: string) => {
     setLoading(true);
-    setPath(p);
+    setErr(null);
     try {
       const d = await getDirs(p);
+      // Use the server's resolved path (empty/relative input → server picks a
+      // real absolute dir) so the input always shows the directory we're
+      // actually browsing, and "sessions here" matches it.
+      const resolved = d.path ?? p;
+      setPath(resolved);
       setEntries(d.entries ?? []);
-      setParent(d.parent ?? p);
+      setParent(d.parent ?? resolved);
       setErr(d.error ?? null);
-      setSessions(await getSessions(p));
+      setSessions(await getSessions(resolved));
     } catch (e) {
       setErr(String(e));
     } finally {

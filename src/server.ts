@@ -932,7 +932,15 @@ app.get("/api/files-watch", (c) => {
 });
 
 app.get("/api/dirs", (c) => {
-  const root = c.req.query("path") ?? rt().cwd;
+  const queried = c.req.query("path")?.trim();
+  // Empty/missing path (session not init'd yet, or user cleared the input) →
+  // fall back to a live session's cwd, else the server's cwd. path.resolve
+  // normalizes "" and relative paths to an absolute dir so the picker's input
+  // + up-arrow always work — without this, an empty path left the picker
+  // blank with a "cannot read path" error and a dead up-arrow (the picker
+  // passed "" straight through and readdirSync("") threw).
+  const fallback = [...sessions.values()][0]?.cwd ?? cwd;
+  const root = path.resolve(queried || fallback);
   let entries: { name: string; path: string }[] = [];
   let readError = false;
   try {
