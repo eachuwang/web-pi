@@ -92,6 +92,11 @@ export function FileExplorer({
   // Reset expansion on cwd switch.
   useEffect(() => { setExpanded(new Set()); }, [cwd]);
   useEffect(() => {
+    // Resident tree mounts before the session's cwd is known (session_init is
+    // in flight) — cwd is "" then. Skip the fetch rather than hitting
+    // /api/files/. (relative path) which the server 403s. session_init will
+    // set a real cwd and re-trigger this effect.
+    if (!cwd) { setRoots([]); setLoading(false); setErr(null); return; }
     setLoading(true); setErr(null);
     fetchEntries(cwd).then(setRoots).catch((e) => setErr(String(e))).finally(() => setLoading(false));
   }, [cwd]);
@@ -102,8 +107,9 @@ export function FileExplorer({
 
   return (
     <div className="fe">
-      <div className="fe-head">files · <span className="fe-cwd">{cwd}</span></div>
-      {loading ? <div className="fe-empty">loading…</div>
+      <div className="fe-head">files{cwd ? " · " : ""}{cwd && <span className="fe-cwd">{cwd}</span>}</div>
+      {!cwd ? <div className="fe-empty">waiting for session…</div>
+        : loading ? <div className="fe-empty">loading…</div>
         : err ? <div className="fe-empty err">{err}</div>
         : roots.map((n) => (
           <TreeNode key={n.fullPath} node={n} depth={0} cwd={cwd} onOpenFile={onOpenFile} onMention={onMention} expanded={expanded} onToggle={toggle} />

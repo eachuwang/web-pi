@@ -226,10 +226,9 @@ export function App() {
   // F04: git worktree picker. Switching = doSwitch(worktreePath) → new live
   // session in that cwd.
   const [wtPicker, setWtPicker] = useState(false);
-  // F05: file browser. `filesOpen` toggles the left explorer drawer; `viewerFile`
-  // opens the right viewer drawer for a file path. Mention inserts a relative
-  // path into the chat input (plain text, per F05 grill).
-  const [filesOpen, setFilesOpen] = useState(false);
+  // F05: resident file tree (right pane). `viewerFile` opens the right viewer
+  // drawer for a file path. Mention inserts a relative path into the chat input
+  // (plain text, per F05 grill).
   const [viewerFile, setViewerFile] = useState<string | null>(null);
   // F06: skills management panel (search/install/enable-disable).
   const [skillsOpen, setSkillsOpen] = useState(false);
@@ -1030,7 +1029,24 @@ export function App() {
           <span className="tb-label">$</span>
           {money(stats?.cost ?? 0)}<span className="tb-dim"> · {money(usage?.total.cost ?? 0)}</span>
         </span>
+        <span
+          className="tb-tok"
+          title={`tokens — in ${human(stats?.tokens?.input ?? 0)} · out ${human(stats?.tokens?.output ?? 0)} · cache read ${human(stats?.tokens?.cacheRead ?? 0)} · total ${human(stats?.tokens?.total ?? 0)}`}
+        >
+          <span className="tb-label">tk</span>
+          <span className="tb-dim">↑</span>{human(stats?.tokens?.input ?? 0)}
+          <span className="tb-dim"> ↓</span>{human(stats?.tokens?.output ?? 0)}
+        </span>
         <span className="tb-status">
+          {stats && stats.pendingToolCalls.length > 0 && (
+            <span className="tb-flag live" title={`${stats.pendingToolCalls.length} running tool call(s)`}>{`⚙ ${stats.pendingToolCalls.length}`}</span>
+          )}
+          {queue.steer.length > 0 && (
+            <span className="tb-flag warn" title={`${queue.steer.length} queued steer`}>{`⇶ ${queue.steer.length}`}</span>
+          )}
+          {queue.follow.length > 0 && (
+            <span className="tb-flag neutral" title={`${queue.follow.length} queued follow-up`}>{`↪ ${queue.follow.length}`}</span>
+          )}
           {compacting && (<span className="tb-flag warn" title="compacting context">compacting…</span>)}
           {retry && (<span className="tb-flag warn" title="auto-retry in progress">{`retry ${retry.attempt}/${retry.maxAttempts}…`}</span>)}
           {streaming && !compacting && !retry && (<span className="tb-flag live" title="streaming">streaming</span>)}
@@ -1293,9 +1309,6 @@ export function App() {
               <button className="cwd-btn" onClick={() => setPicker(true)} title="switch cwd / resume session">
                 <span className="cwd">{session?.cwd ?? "…"}</span> <span className="arr" />
               </button>
-              <button className="cwd-btn" onClick={() => setFilesOpen((v) => !v)} title="browse files — preview source/image/PDF/audio">
-                <span className="cwd">files</span> <span className="arr" />
-              </button>
               <span className="ctrl-label">git</span>
               <button className="git-btn" onClick={() => setBranchPicker(true)} disabled={!gitInfo?.repo} title={gitInfo?.repo ? gitInfo.current : "not a git repo"}>
                 <span className="branch-name">{gitInfo ? (gitInfo.repo ? gitInfo.current : "no git") : "…"}</span> <span className="arr" />
@@ -1306,107 +1319,19 @@ export function App() {
             </div>
           </section>
 
+          {/* F05→resident: the right pane is now a persistent file tree (like
+              VS Code's explorer), no longer a popup drawer. Context/Cost/Tokens
+              moved to the topbar; Queue surfaced as topbar count badges. Clicking
+              a file opens the FileViewer right-drawer overlay; @ inserts a path. */}
           <aside className="dash">
-            <div className="panel">
-              <h2>Context</h2>
-              {stats?.contextUsage ? (
-                <>
-                  <div className="kv">
-                    <span className="k">used</span>
-                    <span className="v">
-                      {human(stats.contextUsage.tokens ?? 0)} / {human(stats.contextUsage.contextWindow)}
-                    </span>
-                  </div>
-                  <div className="ctxbar">
-                    <span style={{ width: `${Math.min(100, Math.max(0, ctxPct ?? 0))}%` }} />
-                  </div>
-                  <div className="kv">
-                    <span className="k">percent</span>
-                    <span className="v">{ctxPct === null ? "—" : ctxPct.toFixed(1)}%</span>
-                  </div>
-                </>
-              ) : (
-                <div className="empty">—</div>
-              )}
-            </div>
-
-            <div className="panel">
-              <h2>Cost</h2>
-              <div className="stats">
-                <div className="stat">
-                  <div className="k">this session</div>
-                  <div className="v">{money(stats?.cost ?? 0)}</div>
-                </div>
-                <div className="stat">
-                  <div className="k">all time</div>
-                  <div className="v">{money(usage?.total.cost ?? 0)}</div>
-                </div>
-              </div>
-              {usage?.total.toolCalls ? (
-                <div className="kv">
-                  <span className="k">total tool calls</span>
-                  <span className="v">{human(usage.total.toolCalls)}</span>
-                </div>
-              ) : null}
-            </div>
-
-            <div className="panel">
-              <h2>Tokens</h2>
-              {stats ? (
-                <div className="stats">
-                  <div className="stat">
-                    <div className="k">input</div>
-                    <div className="v">{human(stats.tokens.input)}</div>
-                  </div>
-                  <div className="stat">
-                    <div className="k">output</div>
-                    <div className="v">{human(stats.tokens.output)}</div>
-                  </div>
-                  <div className="stat">
-                    <div className="k">cache read</div>
-                    <div className="v">{human(stats.tokens.cacheRead)}</div>
-                  </div>
-                  <div className="stat">
-                    <div className="k">total</div>
-                    <div className="v">{human(stats.tokens.total)}</div>
-                  </div>
-                </div>
-              ) : (
-                <div className="empty">—</div>
-              )}
-            </div>
-
-            <div className="panel">
-              <h2>Queue</h2>
-              {stats && stats.pendingToolCalls.length > 0 && (
-                <>
-                  {stats.pendingToolCalls.map((tc) => (
-                    <div key={`p${tc}`} className="queue-item">
-                      <span className="tag running">running</span>
-                      <span className="txt">{tc}</span>
-                    </div>
-                  ))}
-                </>
-              )}
-              {queue.steer.length === 0 && queue.follow.length === 0 && (!stats || stats.pendingToolCalls.length === 0) ? (
-                <div className="empty">no queued messages</div>
-              ) : (
-                <>
-                  {queue.steer.map((q, i) => (
-                    <div key={`s${i}`} className="queue-item">
-                      <span className="tag steer">steer</span>
-                      <span className="txt">{q}</span>
-                    </div>
-                  ))}
-                  {queue.follow.map((q, i) => (
-                    <div key={`f${i}`} className="queue-item">
-                      <span className="tag follow">follow</span>
-                      <span className="txt">{q}</span>
-                    </div>
-                  ))}
-                </>
-              )}
-            </div>
+            <FileExplorer
+              cwd={session?.cwd ?? ""}
+              onOpenFile={(p) => setViewerFile(p)}
+              onMention={(rel) => {
+                setInput((cur) => (cur ? `${cur} ${rel}` : rel));
+                inputRef.current?.focus();
+              }}
+            />
           </aside>
         </div>
       </div>
@@ -1444,19 +1369,9 @@ export function App() {
           }}
         />
       )}
-      {/* F05: file explorer (left drawer) + file viewer (right drawer overlay). */}
-      {filesOpen && (
-        <div className="fe-overlay" onClick={(e) => e.target === e.currentTarget && setFilesOpen(false)}>
-          <FileExplorer
-            cwd={session?.cwd ?? "."}
-            onOpenFile={(p) => setViewerFile(p)}
-            onMention={(rel) => {
-              setInput((cur) => (cur ? `${cur} ${rel}` : rel));
-              inputRef.current?.focus();
-            }}
-          />
-        </div>
-      )}
+      {/* F05: file viewer (right drawer overlay). The explorer itself is now a
+          persistent right pane (see aside.dash above), so only the viewer opens
+          as an overlay when a file is clicked. */}
       {viewerFile && (
         <FileViewer filePath={viewerFile} cwd={session?.cwd ?? "."} onClose={() => setViewerFile(null)} />
       )}
