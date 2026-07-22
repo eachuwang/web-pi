@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getDirs, getSessions, type DirEntry, type SessionListItem } from "../lib/api";
+import { Icon } from "./Icon";
 
 // Directory browser + session resume picker. Browses subdirs of a path, lists
 // saved sessions in the selected cwd, and calls back on "new session here" or
@@ -51,11 +52,11 @@ export function CwdPicker({
       <div className="sheet">
         <header className="sheet-head">
           <div className="sheet-title">switch session / cwd</div>
-          <div className="x" onClick={onClose}>✕</div>
+          <div className="x" onClick={onClose}><Icon name="close" /></div>
         </header>
         <div className="sheet-body">
           <div className="path-input">
-            <button className="btn" onClick={goUp} disabled={parent === path}>↑</button>
+            <button className="btn" onClick={goUp} disabled={parent === path}><Icon name="arrow-up" /></button>
             <input
               className="path"
               value={path}
@@ -74,7 +75,7 @@ export function CwdPicker({
             ) : (
               entries.map((d) => (
                 <div key={d.path} className="dir-row" onClick={() => void load(d.path)}>
-                  <span className="ic">▸</span> {d.name}
+                  <Icon name="chevron-right" className="ic" /> {d.name}
                 </div>
               ))
             )}

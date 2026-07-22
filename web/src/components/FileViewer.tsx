@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Icon } from "./Icon";
 
 // F05: file viewer — right drawer overlay. Dispatches by extension (borrowed
 // from pi-web's FileViewer): image → <img>, audio → <audio>, PDF → <iframe>,
@@ -62,8 +63,8 @@ export function FileViewer({ filePath, cwd, onClose }: { filePath: string; cwd: 
       <div className="fv-drawer">
         <header className="fv-head">
           <span className="fv-path" title={filePath}>{rel(filePath, cwd)}</span>
-          <span className={`fv-live ${watching ? "on" : ""}`} title={watching ? "live sync" : "static"}>{watching ? "● live" : "○ static"}</span>
-          <button className="fv-x" onClick={onClose} title="close">✕</button>
+          <span className={`fv-live ${watching ? "on" : ""}`} title={watching ? "live sync" : "static"}><Icon name={watching ? "dot" : "dot-empty"} /> {watching ? "live" : "static"}</span>
+          <button className="fv-x" onClick={onClose} title="close"><Icon name="close" /></button>
         </header>
         <div className="fv-body">
           {err ? <div className="fv-err">{err}</div>

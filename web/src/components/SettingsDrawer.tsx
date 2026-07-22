@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Icon } from "./Icon";
 import {
   getSettings,
   putSettings,
@@ -265,13 +266,13 @@ export function SettingsDrawer({
     <aside className="settings-drawer" role="dialog" aria-label="Settings">
       <header className="sd-head">
         <h2>Settings</h2>
-        <button className="sd-close" onClick={onClose} title="close">✕</button>
+        <button className="sd-close" onClick={onClose} title="close"><Icon name="close" /></button>
       </header>
       <div className="sd-body">
       <section className="sd-section">
         <div className="sd-section-title">
           <span>Model Providers</span>
-          <button className="sd-add" onClick={addCustom} title="add custom provider">+ custom</button>
+          <button className="sd-add" onClick={addCustom} title="add custom provider"><Icon name="plus" /> custom</button>
         </div>
 
         <div className="sd-add-preset">
@@ -361,13 +362,13 @@ function ProviderRow({
         <span className="sd-row-name">{preset?.name ?? row.name ?? row.id}</span>
         {row.custom && <span className="sd-tag">custom</span>}
         {!row.custom && <span className="sd-tag sd-tag-preset">preset</span>}
-        {row.hasKey && !row.apiKey && <span className="sd-tag sd-tag-key" title="key saved">key ✓</span>}
+        {row.hasKey && !row.apiKey && <span className="sd-tag sd-tag-key" title="key saved">key <Icon name="check" /></span>}
         {row.custom && (
           <button className="sd-row-edit" onClick={onToggleExpand} title={collapsed ? "edit" : "collapse"}>
-            {collapsed ? "✎ edit" : "▴ collapse"}
+            {collapsed ? <><Icon name="edit" /> edit</> : <><Icon name="chevron-up" /> collapse</>}
           </button>
         )}
-        <button className="sd-row-del" onClick={onRemove} title="remove">✕</button>
+        <button className="sd-row-del" onClick={onRemove} title="remove"><Icon name="close" /></button>
       </div>
 
       {collapsed && (
@@ -436,7 +437,7 @@ function ProviderRow({
                 onClick={() => onChange({ models: [...(row.models ?? []), ""] })}
                 title="add another model id"
               >
-                + model
+                <Icon name="plus" /> model
               </button>
             </div>
             {(row.models ?? []).length === 0 && (
@@ -487,7 +488,7 @@ function ProviderRow({
                       title="remove model"
                       onClick={() => onChange({ models: (row.models ?? []).filter((_, j) => j !== i) })}
                     >
-                      ✕
+                      <Icon name="close" />
                     </button>
                   </div>
                   {row.custom && mid && (
@@ -523,7 +524,7 @@ function ProviderRow({
                     <div className="sd-model-limits sd-preset-limits">
                       {ctxVal ? <span className="sd-readonly">{formatSize(ctxVal)} ctx</span> : null}
                       {maxVal ? <span className="sd-readonly">{formatSize(maxVal)} out</span> : null}
-                      {opt.reasoning ? <span className="sd-readonly">reasoning ✓</span> : null}
+                      {opt.reasoning ? <span className="sd-readonly">reasoning <Icon name="check" /></span> : null}
                     </div>
                   )}
                 </div>

@@ -41,6 +41,7 @@ import { Sidebar } from "./components/Sidebar";
 import { WorktreePicker } from "./components/WorktreePicker";
 import { FileExplorer } from "./components/FileExplorer";
 import { FileViewer } from "./components/FileViewer";
+import { Icon } from "./components/Icon";
 import { SkillsPanel } from "./components/SkillsPanel";
 import type { LiveSession } from "./lib/api";
 
@@ -562,7 +563,7 @@ export function App() {
           setCompacting(false);
           // Success/abort → topbar only; a genuine compaction ERROR still merits
           // a main-chat line (it's actionable).
-          if (ce.errorMessage) pushSystem(`⚠ 上下文压缩失败：${ce.errorMessage}`, "err");
+          if (ce.errorMessage) pushSystem(`上下文压缩失败：${ce.errorMessage}`, "err");
           void fetchStats();
           break;
         }
@@ -577,7 +578,7 @@ export function App() {
         case "auto_retry_end": {
           const ar = e as { success?: boolean; attempt?: number; finalError?: string };
           setRetry(null);
-          if (!ar.success) pushSystem(`⚠ 重试 ${ar.attempt ?? "?"} 次仍失败：${ar.finalError ?? ""}`, "err");
+          if (!ar.success) pushSystem(`重试 ${ar.attempt ?? "?"} 次仍失败：${ar.finalError ?? ""}`, "err");
           break;
         }
         case "message_end": {
@@ -585,7 +586,7 @@ export function App() {
           // also fire, but a non-retryable stopReason would otherwise vanish).
           const msg = (e as { message?: { stopReason?: string; errorMessage?: string } }).message;
           if (msg?.stopReason === "error" || msg?.stopReason === "aborted") {
-            pushSystem(`⚠ 模型中止（${msg.stopReason}）${msg.errorMessage ? `：${msg.errorMessage}` : ""}`, "err");
+            pushSystem(`模型中止（${msg.stopReason}）${msg.errorMessage ? `：${msg.errorMessage}` : ""}`, "err");
           }
           break;
         }
@@ -991,7 +992,7 @@ export function App() {
             title="skills — search / install / enable-disable"
             aria-label="skills"
           >
-            ⚡
+            <Icon name="bolt" />
           </button>
           <button
             className="gear"
@@ -1000,7 +1001,7 @@ export function App() {
             title="fork — branch a new session from a past user message"
             aria-label="fork session"
           >
-            ↳
+            <Icon name="fork" />
           </button>
           <button
             className={`gear ${showSettings ? "on" : ""}`}
@@ -1008,7 +1009,7 @@ export function App() {
             title="settings — model providers"
             aria-label="settings"
           >
-            ⚙
+            <Icon name="settings" />
           </button>
         </div>
       </header>
@@ -1034,18 +1035,18 @@ export function App() {
           title={`tokens — in ${human(stats?.tokens?.input ?? 0)} · out ${human(stats?.tokens?.output ?? 0)} · cache read ${human(stats?.tokens?.cacheRead ?? 0)} · total ${human(stats?.tokens?.total ?? 0)}`}
         >
           <span className="tb-label">tk</span>
-          <span className="tb-dim">↑</span>{human(stats?.tokens?.input ?? 0)}
-          <span className="tb-dim"> ↓</span>{human(stats?.tokens?.output ?? 0)}
+          <Icon name="arrow-up" className="tb-dim" />{human(stats?.tokens?.input ?? 0)}
+          <Icon name="arrow-down" className="tb-dim" />{human(stats?.tokens?.output ?? 0)}
         </span>
         <span className="tb-status">
           {stats && stats.pendingToolCalls.length > 0 && (
-            <span className="tb-flag live" title={`${stats.pendingToolCalls.length} running tool call(s)`}>{`⚙ ${stats.pendingToolCalls.length}`}</span>
+            <span className="tb-flag live" title={`${stats.pendingToolCalls.length} running tool call(s)`}><Icon name="loader" className="spin" /> {stats.pendingToolCalls.length}</span>
           )}
           {queue.steer.length > 0 && (
-            <span className="tb-flag warn" title={`${queue.steer.length} queued steer`}>{`⇶ ${queue.steer.length}`}</span>
+            <span className="tb-flag warn" title={`${queue.steer.length} queued steer`}><Icon name="bolt" /> {queue.steer.length}</span>
           )}
           {queue.follow.length > 0 && (
-            <span className="tb-flag neutral" title={`${queue.follow.length} queued follow-up`}>{`↪ ${queue.follow.length}`}</span>
+            <span className="tb-flag neutral" title={`${queue.follow.length} queued follow-up`}><Icon name="arrow-down" /> {queue.follow.length}</span>
           )}
           {compacting && (<span className="tb-flag warn" title="compacting context">compacting…</span>)}
           {retry && (<span className="tb-flag warn" title="auto-retry in progress">{`retry ${retry.attempt}/${retry.maxAttempts}…`}</span>)}
@@ -1091,10 +1092,10 @@ export function App() {
                         )}
                         <div className="seg skill">
                           <div className="head clickable" onClick={() => toggle(entry.id)}>
-                            <span className="chev">{expanded.has(entry.id) ? "▾" : "▸"}</span>
+                            <span className="chev"><Icon name={expanded.has(entry.id) ? "chevron-down" : "chevron-right"} /></span>
                             <span className="tag">skill</span>
                             <span className="name">{sm[1]}</span>
-                            <span className="status success">✓</span>
+                            <span className="status success"><Icon name="check" /></span>
                           </div>
                           {expanded.has(entry.id) && <div className="body">{entry.text}</div>}
                         </div>
@@ -1124,7 +1125,7 @@ export function App() {
                         return (
                           <div key={s.id} className={`seg thinking ${!s.done ? "active" : ""}`}>
                             <div className="head" onClick={() => s.done && toggle(s.id)}>
-                              <span className="chev">{s.done ? (isExpanded(s) ? "▾" : "▸") : ""}</span>
+                              <span className="chev">{s.done ? <Icon name={isExpanded(s) ? "chevron-down" : "chevron-right"} /> : null}</span>
                               <span className="label">thinking</span>
                               {!s.done && (
                                 <span className="think-dots">
@@ -1144,11 +1145,11 @@ export function App() {
                           return (
                             <div key={s.id} className="seg skill">
                               <div className="head clickable" onClick={() => toggle(s.id)}>
-                                <span className="chev">{isExpanded(s) ? "▾" : "▸"}</span>
+                                <span className="chev"><Icon name={isExpanded(s) ? "chevron-down" : "chevron-right"} /></span>
                                 <span className="tag">skill</span>
                                 <span className="name">{skillName}</span>
                                 <span className={`status ${s.status}`}>
-                                  {s.status === "running" ? "…" : s.status === "success" ? "✓" : "✗"}
+                                  {s.status === "running" ? <Icon name="loader" className="spin" /> : s.status === "success" ? <Icon name="check" /> : <Icon name="close" />}
                                 </span>
                               </div>
                               {isExpanded(s) && s.args && <div className="body">{s.args}</div>}
@@ -1228,7 +1229,7 @@ export function App() {
                         title="remove image"
                         onClick={() => removeImage(i)}
                       >
-                        ✕
+                        <Icon name="close" />
                       </button>
                       {!im.data && <span className="img-chip-loading" title="reading file…">…</span>}
                     </div>
@@ -1344,7 +1345,7 @@ export function App() {
           <div className="sheet" style={{ maxWidth: 420 }}>
             <header className="sheet-head">
               <div className="sheet-title">{confirmDialog.title}</div>
-              <div className="x" onClick={() => setConfirmDialog(null)}>✕</div>
+              <div className="x" onClick={() => setConfirmDialog(null)}><Icon name="close" /></div>
             </header>
             <div className="sheet-body">
               <div className="confirm-body">{confirmDialog.body}</div>
@@ -1398,7 +1399,7 @@ export function App() {
           <div className="sheet" style={{ maxWidth: 560 }}>
             <header className="sheet-head">
               <div className="sheet-title">fork from a user message</div>
-              <div className="x" onClick={() => !forking && setForkPicker(false)}>✕</div>
+              <div className="x" onClick={() => !forking && setForkPicker(false)}><Icon name="close" /></div>
             </header>
             <div className="sheet-body">
               <div className="fork-hint">

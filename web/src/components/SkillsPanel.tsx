@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Icon } from "./Icon";
 
 // F06: skill management panel. List (from the agent's own loader — zero drift),
 // enable/disable (frontmatter toggle via PATCH), search (skills.sh /api/search),
@@ -91,7 +92,7 @@ export function SkillsPanel({ sessionId, onClose }: { sessionId?: string; onClos
       <div className="sheet" style={{ maxWidth: 640 }}>
         <header className="sheet-head">
           <div className="sheet-title">skills</div>
-          <div className="x" onClick={onClose}>✕</div>
+          <div className="x" onClick={onClose}><Icon name="close" /></div>
         </header>
         <div className="sheet-body">
           {err && <div className="fork-hint" style={{ color: "var(--red)" }}>{err}</div>}

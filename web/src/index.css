@@ -353,6 +353,7 @@ h2 {
 .chev {
   color: var(--dim);
   width: 10px;
+  height: 10px;
   display: inline-block;
 }
 .system {
@@ -383,6 +384,13 @@ header.app {
 /* F02: topbar status strip — context %, cost, compaction/retry/streaming
    flag. Sits between header and the three-column layout. Font matches the
    brand (var(--mono)) so it reads as part of the app chrome, not chat. */
+/* Flat SVG icons (<Icon>). Size follows font-size (1em); vertical-align
+   keeps them centered in inline text. Flex-centered buttons ignore the
+   vertical-align. No emoji anywhere — every icon goes through .icn. */
+.icn { width: 1em; height: 1em; display: inline-block; vertical-align: -0.14em; flex-shrink: 0; }
+@keyframes icn-spin { to { transform: rotate(360deg); } }
+.icn.spin { animation: icn-spin 0.9s linear infinite; }
+
 .topbar {
   display: flex;
   align-items: center;
@@ -594,7 +602,10 @@ header.app {
 .branch-row .branch-mark {
   font-size: 10px;
   color: var(--dim);
+  display: inline-flex;
+  align-items: center;
 }
+.branch-mark.on { color: var(--green); }
 .branch-form {
   display: flex;
   gap: 6px;
@@ -823,6 +834,9 @@ header.app {
   font-size: 11px;
   text-transform: none;
   letter-spacing: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 .sb-new:hover:not(:disabled) { background: rgba(184, 134, 11, 0.08); }
 .sb-new:disabled { opacity: 0.4; cursor: default; }
@@ -932,6 +946,9 @@ header.app {
   width: 22px;
   height: 20px;
   padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .sb-collapse:hover { color: var(--ink); border-color: var(--amber); }
 .sb-actions {
@@ -948,6 +965,9 @@ header.app {
   font-size: 12px;
   padding: 2px;
   line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .sb-act:hover { color: var(--ink); }
 .sb-act.sb-delete:hover { color: var(--red); }
@@ -1359,7 +1379,9 @@ header.app {
   user-select: none;
 }
 .fe-row:hover { background: var(--bg); }
-.fe-chev { width: 10px; flex-shrink: 0; color: var(--dim); font-size: 10px; }
+.fe-chev { width: 10px; height: 10px; flex-shrink: 0; color: var(--dim); font-size: 10px; }
+.fe-icon { width: 14px; height: 14px; flex-shrink: 0; color: var(--dim); }
+.fe-row.dir .fe-icon { color: var(--amber); }
 .fe-name {
   flex: 1;
   font-size: 12px;
@@ -1413,7 +1435,16 @@ header.app {
 .fv-path { flex: 1; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fv-live { font-size: 10px; color: var(--dim); }
 .fv-live.on { color: var(--green); }
-.fv-x { border: none; background: none; cursor: pointer; font-size: 14px; color: var(--dim); }
+.fv-x {
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--dim);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
 .fv-body { flex: 1; overflow: auto; padding: 12px; }
 .fv-img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; margin: 0 auto; }
 .fv-audio { width: 100%; margin-top: 40px; }
@@ -1579,8 +1610,10 @@ header.app {
   border-radius: 6px;
   width: 26px;
   height: 26px;
-  line-height: 24px;
-  text-align: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
   color: var(--dim);
 }
 .x:hover {
@@ -1665,8 +1698,12 @@ header.app {
   background: var(--bg);
   border-radius: 6px;
   cursor: pointer;
-  padding: 2px 8px;
+  padding: 4px 8px;
   color: var(--dim);
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .sd-close:hover { color: var(--ink); border-color: var(--amber); }
 .sd-section { padding: 14px 16px; border-bottom: 1px solid var(--line); }
@@ -1689,6 +1726,9 @@ header.app {
   padding: 2px 8px;
   cursor: pointer;
   font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 .sd-add:hover { background: rgba(184, 134, 11, 0.08); }
 .sd-add-preset select,
@@ -1737,6 +1777,10 @@ header.app {
   background: transparent;
   color: var(--dim);
   cursor: pointer;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .sd-row-del:hover { color: var(--red); }
 .sd-row-edit {
@@ -1748,6 +1792,9 @@ header.app {
   font-size: 10px;
   padding: 1px 7px;
   margin-left: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 .sd-row-edit:hover { color: var(--ink); border-color: var(--amber); }
 /* #6: collapsed custom row — compact card with a summary line */
@@ -1921,6 +1968,9 @@ header.app {
   font-size: 11px;
   text-transform: none;
   letter-spacing: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 .sd-add-model:hover { background: rgba(184, 134, 11, 0.08); }
 .sd-model-item {
@@ -1950,5 +2000,9 @@ header.app {
   width: 24px;
   height: 28px;
   cursor: pointer;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .sd-model-del:hover { color: var(--red); border-color: var(--red); }

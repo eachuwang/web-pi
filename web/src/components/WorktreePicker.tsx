@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getWorktrees, type Worktree } from "../lib/api";
+import { Icon } from "./Icon";
 
 // F04: git worktree switcher. Lists the repo's worktrees (each is an
 // independent working tree on a branch); clicking one calls onSwitch(path) →
@@ -43,7 +44,7 @@ export function WorktreePicker({
       <div className="sheet" style={{ maxWidth: 560 }}>
         <header className="sheet-head">
           <div className="sheet-title">git worktrees</div>
-          <div className="x" onClick={() => !busy && onClose()}>✕</div>
+          <div className="x" onClick={() => !busy && onClose()}><Icon name="close" /></div>
         </header>
         <div className="sheet-body">
           {err ? (
@@ -59,7 +60,7 @@ export function WorktreePicker({
                   disabled={busy}
                   onClick={() => pick(w.path)}
                 >
-                  <span className="fork-idx">{w.isMain ? "★" : ""}</span>
+                  <span className="fork-idx">{w.isMain && <Icon name="star" />}</span>
                   <span className="fork-text">
                     <div className="wt-branch">{w.branch || w.head}</div>
                     <div className="wt-path">{w.path}</div>

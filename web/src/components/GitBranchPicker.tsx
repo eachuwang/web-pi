@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getGitBranch, gitCheckout, gitCreateBranch, type GitInfo } from "../lib/api";
+import { Icon } from "./Icon";
 
 // Branch switcher + new-branch creator for the session cwd's git repo.
 // Lists local branches (click to switch) and a form to create a new branch
@@ -60,7 +61,7 @@ export function GitBranchPicker({
       <div className="sheet" style={{ maxWidth: 440 }}>
         <header className="sheet-head">
           <div className="sheet-title">git branch</div>
-          <div className="x" onClick={onClose}>✕</div>
+          <div className="x" onClick={onClose}><Icon name="close" /></div>
         </header>
         <div className="sheet-body">
           {!info ? (
@@ -81,7 +82,7 @@ export function GitBranchPicker({
                     disabled={b === info.current || busy}
                     onClick={() => void checkout(b)}
                   >
-                    <span className="branch-mark">{b === info.current ? "●" : "○"}</span>
+                    <span className={`branch-mark${b === info.current ? " on" : ""}`}><Icon name={b === info.current ? "dot" : "dot-empty"} /></span>
                     <span className="branch-name">{b}</span>
                   </button>
                 ))}

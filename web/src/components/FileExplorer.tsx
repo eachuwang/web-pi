@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Icon } from "./Icon";
 
 // F05: file tree. Recursive TreeNode with lazy subdir loading (expand →
 // fetchEntries), expandedPaths hoisted to parent, IGNORED filtering done
@@ -57,12 +58,13 @@ function TreeNode({
 
   return (
     <div>
-      <div className="fe-row" onClick={click} title={node.fullPath} style={{ paddingLeft: 6 + depth * 12 }}>
-        <span className="fe-chev">{node.isDir ? (open ? "▾" : "▸") : ""}</span>
+      <div className={`fe-row${node.isDir ? " dir" : ""}`} onClick={click} title={node.fullPath} style={{ paddingLeft: 6 + depth * 12 }}>
+        <span className="fe-chev">{node.isDir ? <Icon name={open ? "chevron-down" : "chevron-right"} /> : null}</span>
+        <Icon name={node.isDir ? "folder" : "file"} className="fe-icon" />
         <span className="fe-name">{node.name}</span>
         {loading && <span className="fe-loading">…</span>}
         {onMention && (
-          <button className="fe-mention" title="insert path into chat" onClick={(e) => { e.stopPropagation(); onMention(rel); }}>@</button>
+          <button className="fe-mention" title="insert path into chat" onClick={(e) => { e.stopPropagation(); onMention(rel); }}><Icon name="at-sign" /></button>
         )}
       </div>
       {node.isDir && open && (

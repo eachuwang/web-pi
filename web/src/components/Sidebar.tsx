@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { LiveSession } from "../lib/api";
+import { Icon } from "./Icon";
 
 // G01 left sidebar: live session list with title (auto from first prompt) +
 // cwd tag, new / switch / rename / archive / delete. The dashboard's old
@@ -41,7 +42,7 @@ export function Sidebar({
     // button at the top. Keeps the browser surface for the chat + dashboard.
     return (
       <aside className="sidebar collapsed">
-        <button className="sb-collapse" onClick={onToggleCollapse} title="expand sessions">▸</button>
+        <button className="sb-collapse" onClick={onToggleCollapse} title="expand sessions"><Icon name="chevron-right" /></button>
         <div className="sb-list">
           {sessions.map((s) => (
             <button
@@ -64,9 +65,9 @@ export function Sidebar({
         <span>Sessions</span>
         <div className="sb-head-right">
           <button className="sb-new" onClick={onNew} disabled={atCap} title={atCap ? `max ${max} reached` : "new session"}>
-            + new
+            <Icon name="plus" /> new
           </button>
-          <button className="sb-collapse" onClick={onToggleCollapse} title="collapse">▾</button>
+          <button className="sb-collapse" onClick={onToggleCollapse} title="collapse"><Icon name="chevron-down" /></button>
         </div>
       </div>
       <div className="sb-list">
@@ -112,7 +113,7 @@ export function Sidebar({
                         setEditing(s.sessionId);
                       }}
                     >
-                      ✎
+                      <Icon name="edit" />
                     </button>
                     <button
                       className="sb-act sb-archive"
@@ -122,7 +123,7 @@ export function Sidebar({
                         onArchive(s.sessionId);
                       }}
                     >
-                      📦
+                      <Icon name="archive" />
                     </button>
                     <button
                       className="sb-act sb-delete"
@@ -132,7 +133,7 @@ export function Sidebar({
                         onDelete(s.sessionId);
                       }}
                     >
-                      🗑
+                      <Icon name="trash" />
                     </button>
                   </span>
                 </>

@@ -1,5 +1,6 @@
 import { useEffect, useState, type KeyboardEvent } from "react";
 import type { SlashCommand } from "../lib/api";
+import { Icon } from "./Icon";
 
 // Searchable skill picker: type to fuzzy-filter skills (multi-token substring
 // match on name + description), arrow/enter to pick. Calls onPick with the full
@@ -58,7 +59,7 @@ export function SkillPicker({
       <div className="sheet" style={{ maxWidth: 480 }}>
         <header className="sheet-head">
           <div className="sheet-title">skill</div>
-          <div className="x" onClick={onClose}>✕</div>
+          <div className="x" onClick={onClose}><Icon name="close" /></div>
         </header>
         <div className="sheet-body">
           <input
