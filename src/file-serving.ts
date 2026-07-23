@@ -80,7 +80,12 @@ export function allowedRoots(sessions: Iterable<{ cwd: string }>): Set<string> {
 export function isPathAllowed(target: string, roots: Set<string>): boolean {
   const resolved = path.resolve(target);
   for (const root of roots) {
-    const rel = path.relative(root, resolved);
+    // Normalize both to the same separator so mixed / and \ on Windows
+    // (front-end sends /, Node path.resolve returns \) doesn't cause false
+    // rejections.
+    const normRoot = root.replace(/\\/g, "/");
+    const normResolved = resolved.replace(/\\/g, "/");
+    const rel = path.relative(normRoot, normResolved);
     if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) return true;
     if (rel === "") return true; // the root itself
   }
