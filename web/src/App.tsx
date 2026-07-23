@@ -612,7 +612,17 @@ export function App() {
   const refreshModels = useCallback(() => {
     void getModels()
       .then(setModels)
-      .catch((e) => pushSystem(`models: ${String(e)}`, "err"));
+      .catch((e) => {
+        const s = String(e);
+        // Backend unreachable (fresh install, server not running, or wrong
+        // port) → actionable hint instead of a raw "TypeError: Failed to fetch"
+        // red line, which a first-time user can't interpret.
+        if (/Failed to fetch|fetch failed|Load failed|NetworkError/i.test(s)) {
+          pushSystem("无法连接到 web-pi 后端服务 — 请确认服务已启动（npm start）", "err");
+        } else {
+          pushSystem(`models: ${s}`, "err");
+        }
+      });
   }, []);
 
   useEffect(() => {
@@ -1078,6 +1088,22 @@ export function App() {
                 stickBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
               }}
             >
+              {entries.length === 0 && (
+                <div className="chat-welcome">
+                  <div className="chat-welcome-title">web-pi</div>
+                  {models.length === 0 ? (
+                    <div className="chat-welcome-hint">
+                      还没有配置模型 — 点{" "}
+                      <button className="chat-welcome-link" onClick={() => setShowSettings(true)}>
+                        <Icon name="settings" /> 设置
+                      </button>{" "}
+                      添加一个 provider，配置后即可开始对话。
+                    </div>
+                  ) : (
+                    <div className="chat-welcome-hint">发送一条消息开始对话。</div>
+                  )}
+                </div>
+              )}
               {entries.map((entry) => {
                 if (entry.kind === "user") {
                   const sm = entry.text.match(/^\/skill:([^\s]+)\s*(.*)$/s);
@@ -1265,22 +1291,33 @@ export function App() {
 
             <div className="controls-row">
               <span className="ctrl-label">Model</span>
-              <select
-                className="sel"
-                value={model ? `${model.provider}/${model.id}` : ""}
-                onChange={(e) => {
-                  const [p, ...rest] = e.target.value.split("/");
-                  const id = rest.join("/");
-                  if (p && id) void onModelChange(p, id);
-                }}
-                disabled={streaming}
-              >
-                {models.map((m) => (
-                  <option key={`${m.provider}/${m.id}`} value={`${m.provider}/${m.id}`}>
-                    {m.name}
-                  </option>
-                ))}
-              </select>
+              {models.length === 0 ? (
+                <button
+                  className="sel sd-empty-action"
+                  onClick={() => setShowSettings(true)}
+                  disabled={streaming}
+                  title="no model configured — open settings to add a provider"
+                >
+                  <Icon name="settings" /> 配置模型…
+                </button>
+              ) : (
+                <select
+                  className="sel"
+                  value={model ? `${model.provider}/${model.id}` : ""}
+                  onChange={(e) => {
+                    const [p, ...rest] = e.target.value.split("/");
+                    const id = rest.join("/");
+                    if (p && id) void onModelChange(p, id);
+                  }}
+                  disabled={streaming}
+                >
+                  {models.map((m) => (
+                    <option key={`${m.provider}/${m.id}`} value={`${m.provider}/${m.id}`}>
+                      {m.name}
+                    </option>
+                  ))}
+                </select>
+              )}
               <span className="ctrl-label">THINK</span>
               <select
                 className="sel"

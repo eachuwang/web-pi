@@ -1173,6 +1173,42 @@ function extractLiveLimits(m: Record<string, unknown>): { contextWindow?: number
   return { contextWindow, maxTokens, reasoning };
 }
 
+// Classify a fetch-models failure into an actionable, human message instead of
+// a raw "TypeError: fetch failed". The settings drawer surfaces this verbatim,
+// so a first-time user (who may have typed a bad baseUrl, no protocol, wrong
+// region, or an invalid key) gets a pointer to what to fix rather than a
+// cryptic Node error string.
+function classifyFetchError(e: unknown, baseUrl?: string): string {
+  const s = String(e);
+  const cause = String((e as { cause?: unknown })?.cause ?? "");
+  const hay = `${s} ${cause}`;
+  if (/Invalid URL|invalid url/i.test(hay)) {
+    return `baseUrl 不是有效 URL（记得带 https://）`;
+  }
+  if (/timeout|aborted|AbortError/i.test(hay)) {
+    return `连接超时（8s）— baseUrl 不可达或地址错误`;
+  }
+  if (/ENOTFOUND|getaddrinfo|EAI_AGAIN|ECONNREFUSED/i.test(hay)) {
+    return `无法连接到 baseUrl（域名解析失败或拒绝连接）— 检查拼写与网络`;
+  }
+  if (/fetch failed|Failed to fetch|NetworkError|Load failed/i.test(hay)) {
+    return `无法连接到 baseUrl（网络错误或地址无效）${baseUrl ? `：${baseUrl}` : ""}`;
+  }
+  return s;
+}
+function classifyHttpError(status: number, r: Response): string {
+  if (status === 401 || status === 403) {
+    return `HTTP ${status} — API key 错误或无权限`;
+  }
+  if (status === 404) {
+    return `HTTP 404 — 该 baseUrl 下没有 /models 端点（确认 URL 是否到 …/v1 这一级）`;
+  }
+  if (status >= 500) {
+    return `HTTP ${status} — 服务端错误`;
+  }
+  return `HTTP ${status}`;
+}
+
 app.post("/api/settings/test", async (c) => {
   const body = await c.req.json<{
     providerId?: string;
@@ -1232,10 +1268,10 @@ app.post("/api/settings/test", async (c) => {
             .filter((x): x is LiveModel => x !== null);
           if (parsed.length) liveModels = parsed;
         } else {
-          liveErr = `endpoint returned ${r.status}`;
+          liveErr = classifyHttpError(r.status, r);
         }
       } catch (e) {
-        liveErr = String(e);
+        liveErr = classifyFetchError(e, body.baseUrl);
       }
     }
 
@@ -1326,9 +1362,13 @@ app.post("/api/settings/test", async (c) => {
         maxTokensLive: false,
         reasoningLive: false,
         source: "registered" as const,
-        warning: liveErr ? `could not fetch /models (${liveErr}); showing registered model` : undefined,
       })),
       source: "registered",
+      // warning is TOP-LEVEL (the frontend reads res.warning, not per-model).
+      // Previously this lived on each model object → the frontend never saw it
+      // and showed a generic "registered; key not validated" info instead of
+      // the classified fetch error (e.g. bad baseUrl / 401 / unreachable).
+      warning: liveErr ? `could not fetch /models (${liveErr}); showing registered model` : undefined,
     });
   } catch (e) {
     return c.json({ ok: false, error: String(e) }, 500);

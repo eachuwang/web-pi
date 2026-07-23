@@ -113,7 +113,13 @@ export function SettingsDrawer({
         })),
       );
       setMaxSessions(s.maxSessions ?? 4);
-    })().catch((e) => setStatus({ kind: "err", msg: `load failed: ${String(e)}` }));
+    })().catch((e) => {
+      const s = String(e);
+      const msg = /Failed to fetch|fetch failed|Load failed|NetworkError/i.test(s)
+        ? "无法连接到 web-pi 后端 — 请确认服务已启动"
+        : `load failed: ${s}`;
+      setStatus({ kind: "err", msg });
+    });
   }, []);
 
   function patch(id: string, patch: Partial<Row>) {
@@ -180,51 +186,64 @@ export function SettingsDrawer({
 
   async function fetchModels(r: Row) {
     patch(r.id, { testing: true, testErr: undefined });
-    const res = await testProvider({
-      providerId: r.id,
-      apiKey: r.apiKey || undefined,
-      baseUrl: r.custom ? r.baseUrl : undefined,
-      api: r.custom ? r.api : undefined,
-      models: r.custom ? r.models : undefined,
-      contextWindow: r.custom ? r.contextWindow : undefined,
-      maxTokens: r.custom ? r.maxTokens : undefined,
-      reasoning: r.custom ? r.reasoning : undefined,
-      modelConfig: r.custom ? r.modelConfig : undefined,
-      custom: r.custom,
-    });
-    if (res.ok && res.models) {
-      // B2: auto-fill per-model ctx/maxTokens/reasoning from the live /models
-      // response. Live values are written into modelConfig (source:"live") so
-      // they persist + register correctly, and the UI shows them read-only via
-      // modelOptions' per-field live flags. Non-live fields stay unset → the
-      // tier dropdown handles them.
-      const mc = { ...(r.modelConfig ?? {}) };
-      for (const m of res.models) {
-        const cur = mc[m.id] ?? {};
-        const next = { ...cur, source: "live" as const };
-        if (m.contextWindowLive && m.contextWindow) next.contextWindow = m.contextWindow;
-        if (m.maxTokensLive && m.maxTokens) next.maxTokens = m.maxTokens;
-        if (m.reasoningLive) next.reasoning = m.reasoning;
-        mc[m.id] = next;
-      }
-      patch(r.id, {
-        models: res.models.map((m) => m.id),
-        modelOptions: res.models,
-        modelConfig: mc,
-        testing: false,
+    try {
+      const res = await testProvider({
+        providerId: r.id,
+        apiKey: r.apiKey || undefined,
+        baseUrl: r.custom ? r.baseUrl : undefined,
+        api: r.custom ? r.api : undefined,
+        models: r.custom ? r.models : undefined,
+        contextWindow: r.custom ? r.contextWindow : undefined,
+        maxTokens: r.custom ? r.maxTokens : undefined,
+        reasoning: r.custom ? r.reasoning : undefined,
+        modelConfig: r.custom ? r.modelConfig : undefined,
+        custom: r.custom,
       });
-      if (res.source === "live") {
-        const filled = res.models.filter((m) => m.contextWindowLive || m.maxTokensLive).length;
-        setStatus({ kind: "ok", msg: `${r.id}: ${res.models.length} models fetched — key OK${filled ? ` · ${filled} auto-filled` : ""}` });
-      } else if (res.warning) {
-        setStatus({ kind: "err", msg: `${r.id}: ${res.warning}` });
+      if (res.ok && res.models) {
+        // B2: auto-fill per-model ctx/maxTokens/reasoning from the live /models
+        // response. Live values are written into modelConfig (source:"live") so
+        // they persist + register correctly, and the UI shows them read-only via
+        // modelOptions' per-field live flags. Non-live fields stay unset → the
+        // tier dropdown handles them.
+        const mc = { ...(r.modelConfig ?? {}) };
+        for (const m of res.models) {
+          const cur = mc[m.id] ?? {};
+          const next = { ...cur, source: "live" as const };
+          if (m.contextWindowLive && m.contextWindow) next.contextWindow = m.contextWindow;
+          if (m.maxTokensLive && m.maxTokens) next.maxTokens = m.maxTokens;
+          if (m.reasoningLive) next.reasoning = m.reasoning;
+          mc[m.id] = next;
+        }
+        patch(r.id, {
+          models: res.models.map((m) => m.id),
+          modelOptions: res.models,
+          modelConfig: mc,
+          testing: false,
+        });
+        if (res.source === "live") {
+          const filled = res.models.filter((m) => m.contextWindowLive || m.maxTokensLive).length;
+          setStatus({ kind: "ok", msg: `${r.id}: ${res.models.length} models fetched — key OK${filled ? ` · ${filled} auto-filled` : ""}` });
+        } else if (res.warning) {
+          setStatus({ kind: "err", msg: `${r.id}: ${res.warning}` });
+        } else {
+          setStatus({ kind: "info", msg: `${r.id}: ${res.models.length} model(s) (registered; key not validated against endpoint)` });
+        }
+        onProvidersChanged?.();
       } else {
-        setStatus({ kind: "info", msg: `${r.id}: ${res.models.length} model(s) (registered; key not validated against endpoint)` });
+        patch(r.id, { testing: false, testErr: res.error ?? "fetch failed" });
+        setStatus({ kind: "err", msg: `${r.id}: ${res.error ?? "fetch failed"}` });
       }
-      onProvidersChanged?.();
-    } else {
-      patch(r.id, { testing: false, testErr: res.error ?? "fetch failed" });
-      setStatus({ kind: "err", msg: `${r.id}: ${res.error ?? "fetch failed"}` });
+    } catch (e) {
+      // Backend unreachable (server not running / wrong port) → testProvider's
+      // fetch rejects. Without this catch the `testing:true` state never
+      // clears and the button stays stuck on "…" (the reported bug). Surface a
+      // friendly, actionable message instead of a raw "TypeError: Failed to fetch".
+      const s = String(e);
+      const friendly = /Failed to fetch|fetch failed|Load failed|NetworkError/i.test(s)
+        ? "无法连接到 web-pi 后端 — 请确认服务已启动"
+        : s;
+      patch(r.id, { testing: false, testErr: friendly });
+      setStatus({ kind: "err", msg: `${r.id}: ${friendly}` });
     }
   }
 

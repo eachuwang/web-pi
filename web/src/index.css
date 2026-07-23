@@ -716,6 +716,23 @@ header.app {
 .sel:disabled {
   opacity: 0.5;
 }
+/* Empty model-picker CTA (no provider configured yet): looks like the select
+   but amber + clickable, guiding a first-time user to open settings. */
+.sd-empty-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 11px;
+  border: 1px solid var(--amber);
+  border-radius: 5px;
+  padding: 3px 8px;
+  background: rgba(184, 134, 11, 0.08);
+  color: var(--amber);
+  cursor: pointer;
+}
+.sd-empty-action:hover:not(:disabled) { background: rgba(184, 134, 11, 0.16); }
+.sd-empty-action:disabled { opacity: 0.5; cursor: default; }
 
 .btn {
   font-family: var(--mono);
@@ -1135,6 +1152,34 @@ header.app {
   overflow: auto;
   font-size: 13.5px;
 }
+/* First-run welcome (no messages yet): guides the user to configure a model
+   if none is set, else prompts them to start chatting. */
+.chat-welcome {
+  margin: 16vh 20px 0;
+  max-width: 480px;
+  text-align: center;
+  color: var(--dim);
+}
+.chat-welcome-title {
+  font-family: var(--mono);
+  font-size: 22px;
+  color: var(--ink);
+  margin-bottom: 10px;
+}
+.chat-welcome-hint { font-size: 13px; line-height: 1.6; }
+.chat-welcome-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: transparent;
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  border-radius: 5px;
+  padding: 1px 7px;
+  cursor: pointer;
+  font: inherit;
+}
+.chat-welcome-link:hover { background: rgba(184, 134, 11, 0.12); }
 .msg {
   margin: 10px 0;
 }
